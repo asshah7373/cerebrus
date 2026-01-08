@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  cerebrus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cerebrus
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=sqlite+aiosqlite:///./data/cerebrus.db
+      - LOG_LEVEL=INFO
+      - DEBUG=false
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      - ./exports:/app/exports
+    restart: unless-stopped
+    networks:
+      - cerebrus-network
+
+  # Optional: Neo4j for advanced knowledge graph features
+  neo4j:
+    image: neo4j:5-community
+    container_name: cerebrus-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/cerebrus123
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j-data:/data
+    restart: unless-stopped
+    networks:
+      - cerebrus-network
+    profiles:
+      - advanced
+
+networks:
+  cerebrus-network:
+    driver: bridge
+
+volumes:
+  neo4j-data:

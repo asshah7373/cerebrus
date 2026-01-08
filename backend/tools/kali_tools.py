@@ -1,0 +1,753 @@
+"""
+Kali Linux Tool Integrations
+Wrappers for common Kali Linux pentesting tools.
+"""
+from typing import Dict, Any, Optional, List
+import re
+import xml.etree.ElementTree as ET
+
+from .base import CommandTool, PythonTool, ToolCategory
+from ..config import settings
+
+
+class NmapTool(CommandTool):
+    """
+    Nmap - Network exploration and security auditing tool.
+
+    Supports various scan types including:
+    - Port scanning
+    - Service detection
+    - OS fingerprinting
+    - Script scanning (NSE)
+    """
+
+    name = "nmap"
+    description = "Network scanner for port discovery, service detection, and vulnerability scanning"
+    category = ToolCategory.SCANNING
+    risk_level = "medium"
+    requires_root = False  # Some scans require root
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = config.get("path") if config else settings.nmap_path
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target is an IP address, hostname, or CIDR range."""
+        # Basic validation - IP, hostname, or CIDR
+        ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$'
+        hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'
+
+        return bool(re.match(ip_pattern, target) or re.match(hostname_pattern, target))
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the nmap command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # Scan type
+        scan_type = opts.get("scan_type", "default")
+        if scan_type == "syn":
+            cmd_parts.append("-sS")
+            self.requires_root = True
+        elif scan_type == "connect":
+            cmd_parts.append("-sT")
+        elif scan_type == "udp":
+            cmd_parts.append("-sU")
+            self.requires_root = True
+        elif scan_type == "comprehensive":
+            cmd_parts.append("-sS -sV -sC -O")
+            self.requires_root = True
+
+        # Port specification
+        if "ports" in opts:
+            cmd_parts.append(f"-p {opts['ports']}")
+        elif opts.get("top_ports"):
+            cmd_parts.append(f"--top-ports {opts['top_ports']}")
+
+        # Service detection
+        if opts.get("service_detection", True):
+            cmd_parts.append("-sV")
+
+        # OS detection
+        if opts.get("os_detection"):
+            cmd_parts.append("-O")
+            self.requires_root = True
+
+        # Scripts
+        if "scripts" in opts:
+            cmd_parts.append(f"--script={opts['scripts']}")
+
+        # Output format (XML for parsing)
+        cmd_parts.append("-oX -")
+
+        # Timing
+        timing = opts.get("timing", "3")
+        cmd_parts.append(f"-T{timing}")
+
+        # Add target
+        cmd_parts.append(target)
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse nmap XML output into structured data."""
+        try:
+            root = ET.fromstring(output)
+        except ET.ParseError:
+            return {"raw": output, "parse_error": "Failed to parse XML output"}
+
+        result = {
+            "hosts": [],
+            "scan_info": {}
+        }
+
+        # Parse scan info
+        scaninfo = root.find("scaninfo")
+        if scaninfo is not None:
+            result["scan_info"] = {
+                "type": scaninfo.get("type"),
+                "protocol": scaninfo.get("protocol"),
+                "services": scaninfo.get("services")
+            }
+
+        # Parse hosts
+        for host in root.findall("host"):
+            host_data = {
+                "status": "unknown",
+                "addresses": [],
+                "hostnames": [],
+                "ports": [],
+                "os": None
+            }
+
+            # Status
+            status = host.find("status")
+            if status is not None:
+                host_data["status"] = status.get("state")
+
+            # Addresses
+            for addr in host.findall("address"):
+                host_data["addresses"].append({
+                    "type": addr.get("addrtype"),
+                    "addr": addr.get("addr")
+                })
+
+            # Hostnames
+            hostnames = host.find("hostnames")
+            if hostnames is not None:
+                for hostname in hostnames.findall("hostname"):
+                    host_data["hostnames"].append({
+                        "name": hostname.get("name"),
+                        "type": hostname.get("type")
+                    })
+
+            # Ports
+            ports = host.find("ports")
+            if ports is not None:
+                for port in ports.findall("port"):
+                    port_data = {
+                        "portid": int(port.get("portid")),
+                        "protocol": port.get("protocol"),
+                        "state": "unknown",
+                        "service": None
+                    }
+
+                    state = port.find("state")
+                    if state is not None:
+                        port_data["state"] = state.get("state")
+
+                    service = port.find("service")
+                    if service is not None:
+                        port_data["service"] = {
+                            "name": service.get("name"),
+                            "product": service.get("product"),
+                            "version": service.get("version"),
+                            "extrainfo": service.get("extrainfo")
+                        }
+
+                    host_data["ports"].append(port_data)
+
+            # OS detection
+            os_elem = host.find("os")
+            if os_elem is not None:
+                osmatch = os_elem.find("osmatch")
+                if osmatch is not None:
+                    host_data["os"] = {
+                        "name": osmatch.get("name"),
+                        "accuracy": osmatch.get("accuracy")
+                    }
+
+            result["hosts"].append(host_data)
+
+        return result
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the options schema for nmap."""
+        return {
+            "type": "object",
+            "properties": {
+                "scan_type": {
+                    "type": "string",
+                    "enum": ["default", "syn", "connect", "udp", "comprehensive"],
+                    "description": "Type of scan to perform"
+                },
+                "ports": {
+                    "type": "string",
+                    "description": "Port specification (e.g., '22,80,443' or '1-1000')"
+                },
+                "top_ports": {
+                    "type": "integer",
+                    "description": "Scan top N most common ports"
+                },
+                "service_detection": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Enable service/version detection"
+                },
+                "os_detection": {
+                    "type": "boolean",
+                    "description": "Enable OS detection"
+                },
+                "scripts": {
+                    "type": "string",
+                    "description": "NSE scripts to run (e.g., 'vuln,default')"
+                },
+                "timing": {
+                    "type": "string",
+                    "enum": ["0", "1", "2", "3", "4", "5"],
+                    "default": "3",
+                    "description": "Timing template (0=paranoid, 5=insane)"
+                }
+            }
+        }
+
+
+class NiktoTool(CommandTool):
+    """
+    Nikto - Web server vulnerability scanner.
+
+    Scans for:
+    - Dangerous files/programs
+    - Outdated software versions
+    - Configuration issues
+    - Default files
+    """
+
+    name = "nikto"
+    description = "Web server scanner for vulnerabilities, misconfigurations, and dangerous files"
+    category = ToolCategory.WEB
+    risk_level = "medium"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = config.get("path") if config else settings.nikto_path
+        self.default_timeout = 600  # 10 minutes
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target is a URL or host."""
+        url_pattern = r'^https?://[^\s/$.?#].[^\s]*$'
+        hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$'
+        ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}(:\d+)?$'
+
+        return bool(
+            re.match(url_pattern, target) or
+            re.match(hostname_pattern, target) or
+            re.match(ip_pattern, target)
+        )
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the nikto command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # Target
+        cmd_parts.append(f"-h {target}")
+
+        # Port
+        if "port" in opts:
+            cmd_parts.append(f"-p {opts['port']}")
+
+        # SSL
+        if opts.get("ssl"):
+            cmd_parts.append("-ssl")
+
+        # Tuning (what to scan for)
+        if "tuning" in opts:
+            cmd_parts.append(f"-Tuning {opts['tuning']}")
+
+        # Plugins
+        if "plugins" in opts:
+            cmd_parts.append(f"-Plugins {opts['plugins']}")
+
+        # Output format
+        cmd_parts.append("-Format json")
+
+        # Timeout
+        if "timeout" in opts:
+            cmd_parts.append(f"-timeout {opts['timeout']}")
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse nikto output."""
+        import json
+
+        try:
+            # Try to parse as JSON
+            data = json.loads(output)
+            return data
+        except json.JSONDecodeError:
+            pass
+
+        # Parse text output
+        findings = []
+        lines = output.split("\n")
+
+        for line in lines:
+            if line.startswith("+ "):
+                findings.append({
+                    "message": line[2:].strip(),
+                    "type": "finding"
+                })
+
+        return {
+            "findings": findings,
+            "raw": output
+        }
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the options schema for nikto."""
+        return {
+            "type": "object",
+            "properties": {
+                "port": {
+                    "type": "integer",
+                    "description": "Port to scan"
+                },
+                "ssl": {
+                    "type": "boolean",
+                    "description": "Force SSL mode"
+                },
+                "tuning": {
+                    "type": "string",
+                    "description": "Scan tuning options"
+                },
+                "plugins": {
+                    "type": "string",
+                    "description": "Plugins to use"
+                }
+            }
+        }
+
+
+class GobusterTool(CommandTool):
+    """
+    Gobuster - Directory/file bruteforcing tool.
+
+    Modes:
+    - dir: Directory/file enumeration
+    - dns: DNS subdomain enumeration
+    - vhost: Virtual host enumeration
+    """
+
+    name = "gobuster"
+    description = "Directory, DNS subdomain, and virtual host brute-forcing tool"
+    category = ToolCategory.ENUMERATION
+    risk_level = "low"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = config.get("path") if config else settings.gobuster_path
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target based on mode."""
+        # Accept URLs for dir mode, domains for dns mode
+        return len(target) > 0
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the gobuster command."""
+        opts = options or {}
+        mode = opts.get("mode", "dir")
+
+        cmd_parts = [self.binary_path, mode]
+
+        if mode == "dir":
+            cmd_parts.append(f"-u {target}")
+
+            # Wordlist
+            wordlist = opts.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+            cmd_parts.append(f"-w {wordlist}")
+
+            # Extensions
+            if "extensions" in opts:
+                cmd_parts.append(f"-x {opts['extensions']}")
+
+            # Status codes to show
+            if "status_codes" in opts:
+                cmd_parts.append(f"-s {opts['status_codes']}")
+
+        elif mode == "dns":
+            cmd_parts.append(f"-d {target}")
+
+            wordlist = opts.get("wordlist", "/usr/share/wordlists/dns/subdomains-top1million-5000.txt")
+            cmd_parts.append(f"-w {wordlist}")
+
+        elif mode == "vhost":
+            cmd_parts.append(f"-u {target}")
+
+            wordlist = opts.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+            cmd_parts.append(f"-w {wordlist}")
+
+        # Threads
+        threads = opts.get("threads", 10)
+        cmd_parts.append(f"-t {threads}")
+
+        # Quiet mode for cleaner output
+        cmd_parts.append("-q")
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse gobuster output."""
+        results = []
+        lines = output.strip().split("\n")
+
+        for line in lines:
+            if not line or line.startswith("==="):
+                continue
+
+            parts = line.split()
+            if len(parts) >= 1:
+                results.append({
+                    "path": parts[0],
+                    "status": parts[1] if len(parts) > 1 else None,
+                    "size": parts[2] if len(parts) > 2 else None
+                })
+
+        return {
+            "discovered": results,
+            "count": len(results)
+        }
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the options schema for gobuster."""
+        return {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["dir", "dns", "vhost"],
+                    "default": "dir",
+                    "description": "Enumeration mode"
+                },
+                "wordlist": {
+                    "type": "string",
+                    "description": "Path to wordlist file"
+                },
+                "extensions": {
+                    "type": "string",
+                    "description": "File extensions to search for (comma-separated)"
+                },
+                "threads": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Number of concurrent threads"
+                },
+                "status_codes": {
+                    "type": "string",
+                    "description": "Status codes to include (comma-separated)"
+                }
+            }
+        }
+
+
+class HydraTool(CommandTool):
+    """
+    Hydra - Password cracking tool.
+
+    Supports many protocols including:
+    SSH, FTP, HTTP, SMB, MySQL, and more.
+
+    WARNING: This is a high-risk tool that should only
+    be used with explicit authorization.
+    """
+
+    name = "hydra"
+    description = "Network login cracker supporting multiple protocols"
+    category = ToolCategory.CREDENTIAL
+    risk_level = "high"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = config.get("path") if config else settings.hydra_path
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target is a host or URL."""
+        return len(target) > 0
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the hydra command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # Username(s)
+        if "username" in opts:
+            cmd_parts.append(f"-l {opts['username']}")
+        elif "username_list" in opts:
+            cmd_parts.append(f"-L {opts['username_list']}")
+
+        # Password(s)
+        if "password" in opts:
+            cmd_parts.append(f"-p {opts['password']}")
+        elif "password_list" in opts:
+            cmd_parts.append(f"-P {opts['password_list']}")
+
+        # Service/protocol
+        service = opts.get("service", "ssh")
+
+        # Threads
+        threads = opts.get("threads", 4)
+        cmd_parts.append(f"-t {threads}")
+
+        # Verbose output
+        cmd_parts.append("-V")
+
+        # Target and service
+        if "port" in opts:
+            cmd_parts.append(f"-s {opts['port']}")
+
+        cmd_parts.append(f"{target}")
+        cmd_parts.append(service)
+
+        # HTTP-specific options
+        if service.startswith("http"):
+            if "http_path" in opts:
+                cmd_parts.append(opts["http_path"])
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse hydra output."""
+        credentials = []
+        lines = output.split("\n")
+
+        for line in lines:
+            # Look for successful logins
+            if "login:" in line.lower() and "password:" in line.lower():
+                # Parse the credential line
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.lower() == "login:":
+                        username = parts[i + 1] if i + 1 < len(parts) else None
+                    if part.lower() == "password:":
+                        password = parts[i + 1] if i + 1 < len(parts) else None
+
+                if username and password:
+                    credentials.append({
+                        "username": username,
+                        "password": password
+                    })
+
+        return {
+            "credentials_found": credentials,
+            "count": len(credentials),
+            "success": len(credentials) > 0
+        }
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the options schema for hydra."""
+        return {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "enum": ["ssh", "ftp", "http-get", "http-post", "smb", "mysql", "rdp"],
+                    "description": "Service/protocol to attack"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Single username to try"
+                },
+                "username_list": {
+                    "type": "string",
+                    "description": "Path to username wordlist"
+                },
+                "password_list": {
+                    "type": "string",
+                    "description": "Path to password wordlist"
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Target port"
+                },
+                "threads": {
+                    "type": "integer",
+                    "default": 4,
+                    "description": "Number of parallel tasks"
+                }
+            },
+            "required": ["service"]
+        }
+
+
+class SQLMapTool(CommandTool):
+    """
+    SQLMap - SQL injection detection and exploitation tool.
+
+    Automatically detects and exploits SQL injection vulnerabilities.
+
+    WARNING: This is a high-risk tool.
+    """
+
+    name = "sqlmap"
+    description = "Automatic SQL injection detection and exploitation tool"
+    category = ToolCategory.WEB
+    risk_level = "high"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = config.get("path") if config else settings.sqlmap_path
+        self.default_timeout = 600  # 10 minutes
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target is a URL."""
+        return target.startswith("http://") or target.startswith("https://")
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the sqlmap command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # Target URL
+        cmd_parts.append(f"-u \"{target}\"")
+
+        # Detection level
+        level = opts.get("level", 1)
+        cmd_parts.append(f"--level={level}")
+
+        # Risk level
+        risk = opts.get("risk", 1)
+        cmd_parts.append(f"--risk={risk}")
+
+        # Specific parameter to test
+        if "param" in opts:
+            cmd_parts.append(f"-p {opts['param']}")
+
+        # Database enumeration
+        if opts.get("dbs"):
+            cmd_parts.append("--dbs")
+        if opts.get("tables"):
+            cmd_parts.append("--tables")
+        if opts.get("dump"):
+            cmd_parts.append("--dump")
+
+        # Non-interactive
+        cmd_parts.append("--batch")
+
+        # Output format
+        cmd_parts.append("--output-dir=/tmp/sqlmap")
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse sqlmap output."""
+        result = {
+            "vulnerable": False,
+            "injection_types": [],
+            "databases": [],
+            "tables": []
+        }
+
+        lines = output.split("\n")
+
+        for line in lines:
+            if "is vulnerable" in line.lower():
+                result["vulnerable"] = True
+            if "Type:" in line:
+                result["injection_types"].append(line.split("Type:")[1].strip())
+            if "[*]" in line and "database" in line.lower():
+                result["databases"].append(line.split("[*]")[1].strip())
+
+        return result
+
+    def get_schema(self) -> Dict[str, Any]:
+        """Get the options schema for sqlmap."""
+        return {
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 1,
+                    "description": "Detection level (1-5)"
+                },
+                "risk": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "default": 1,
+                    "description": "Risk level (1-3)"
+                },
+                "param": {
+                    "type": "string",
+                    "description": "Parameter to test"
+                },
+                "dbs": {
+                    "type": "boolean",
+                    "description": "Enumerate databases"
+                },
+                "tables": {
+                    "type": "boolean",
+                    "description": "Enumerate tables"
+                },
+                "dump": {
+                    "type": "boolean",
+                    "description": "Dump data"
+                }
+            }
+        }
+
+
+# Tool registry for easy importing
+KALI_TOOLS = [
+    NmapTool,
+    NiktoTool,
+    GobusterTool,
+    HydraTool,
+    SQLMapTool
+]
+
+
+def register_all_tools(engine):
+    """Register all Kali tools with an MCP engine."""
+    for tool_class in KALI_TOOLS:
+        engine.register_tool(tool_class)
