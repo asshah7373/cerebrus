@@ -21,6 +21,133 @@ router = APIRouter()
 logger = structlog.get_logger()
 
 
+async def sync_state_to_database(session_id: str, final_state):
+    """
+    Sync orchestrator state to database without re-running workflow.
+    Used after approval resumes a workflow.
+    """
+    try:
+        async with async_session_factory() as db:
+            await _sync_state_impl(db, session_id, final_state)
+    except Exception as e:
+        logger.error(
+            "Failed to sync state to database",
+            session_id=session_id,
+            error=str(e)
+        )
+
+
+async def _sync_state_impl(db, session_id: str, final_state):
+    """Implementation of state sync to database."""
+    # Map orchestrator task status to database status
+    status_map = {
+        "pending": DBTaskStatus.PENDING,
+        "in_progress": DBTaskStatus.IN_PROGRESS,
+        "waiting_approval": DBTaskStatus.WAITING_APPROVAL,
+        "approved": DBTaskStatus.APPROVED,
+        "rejected": DBTaskStatus.REJECTED,
+        "completed": DBTaskStatus.COMPLETED,
+        "failed": DBTaskStatus.FAILED,
+    }
+
+    for task in final_state.tasks:
+        # Check if task already exists
+        result = await db.execute(
+            select(TaskModel).where(TaskModel.id == task.id)
+        )
+        existing_task = result.scalar_one_or_none()
+
+        if existing_task:
+            # Update existing task
+            existing_task.status = status_map.get(task.status.value if hasattr(task.status, 'value') else task.status, DBTaskStatus.PENDING)
+            existing_task.result = task.result
+            existing_task.error = task.error
+            existing_task.started_at = task.started_at
+            existing_task.completed_at = task.completed_at
+        else:
+            # Create new task
+            db_task = TaskModel(
+                id=task.id,
+                session_id=session_id,
+                target_id=task.target_id,
+                name=task.name,
+                task_type=task.task_type,
+                status=status_map.get(task.status.value if hasattr(task.status, 'value') else task.status, DBTaskStatus.PENDING),
+                tool=task.tool,
+                parameters=task.parameters or {},
+                risk_level=task.risk_level,
+                result=task.result,
+                error=task.error,
+                requires_approval=task.requires_approval,
+                started_at=task.started_at,
+                completed_at=task.completed_at,
+            )
+            db.add(db_task)
+
+    # Update session status
+    result = await db.execute(
+        select(SessionModel).where(SessionModel.id == session_id)
+    )
+    session = result.scalar_one_or_none()
+    if session:
+        if final_state.workflow_phase == "complete":
+            session.status = SessionStatus.COMPLETED
+            session.completed_at = datetime.utcnow()
+        elif final_state.workflow_phase == "error":
+            session.status = SessionStatus.FAILED
+
+    # Sync findings to database
+    severity_map = {
+        "info": DBSeverityLevel.INFO,
+        "low": DBSeverityLevel.LOW,
+        "medium": DBSeverityLevel.MEDIUM,
+        "high": DBSeverityLevel.HIGH,
+        "critical": DBSeverityLevel.CRITICAL,
+    }
+
+    for finding in final_state.findings:
+        # Check if finding already exists
+        result = await db.execute(
+            select(FindingModel).where(FindingModel.id == finding.id)
+        )
+        existing_finding = result.scalar_one_or_none()
+
+        if not existing_finding:
+            # Get target_id from finding's target address
+            target_id = None
+            for target in final_state.targets:
+                if target.address == finding.target:
+                    target_id = target.id
+                    break
+
+            db_finding = FindingModel(
+                id=finding.id,
+                session_id=session_id,
+                target_id=target_id,
+                title=finding.title,
+                description=finding.description,
+                severity=severity_map.get(finding.severity, DBSeverityLevel.INFO),
+                category=finding.category,
+                evidence=finding.evidence,
+                remediation=finding.remediation,
+                cve_ids=finding.cve_ids,
+                cvss_score=finding.cvss_score,
+                verified=finding.verified,
+                discovered_at=finding.discovered_at,
+            )
+            db.add(db_finding)
+
+    await db.commit()
+
+    logger.info(
+        "State synced to database",
+        session_id=session_id,
+        tasks_synced=len(final_state.tasks),
+        findings_synced=len(final_state.findings),
+        final_phase=final_state.workflow_phase
+    )
+
+
 async def run_workflow_and_sync(session_id: str, orchestrator):
     """
     Run the orchestrator workflow and sync state back to database.
@@ -30,115 +157,9 @@ async def run_workflow_and_sync(session_id: str, orchestrator):
         # Run the workflow
         final_state = await orchestrator.run_session(session_id)
 
-        # Sync tasks to database
+        # Sync state to database using shared implementation
         async with async_session_factory() as db:
-            # Map orchestrator task status to database status
-            status_map = {
-                "pending": DBTaskStatus.PENDING,
-                "in_progress": DBTaskStatus.IN_PROGRESS,
-                "waiting_approval": DBTaskStatus.WAITING_APPROVAL,
-                "approved": DBTaskStatus.APPROVED,
-                "rejected": DBTaskStatus.REJECTED,
-                "completed": DBTaskStatus.COMPLETED,
-                "failed": DBTaskStatus.FAILED,
-            }
-
-            for task in final_state.tasks:
-                # Check if task already exists
-                result = await db.execute(
-                    select(TaskModel).where(TaskModel.id == task.id)
-                )
-                existing_task = result.scalar_one_or_none()
-
-                if existing_task:
-                    # Update existing task
-                    existing_task.status = status_map.get(task.status.value, DBTaskStatus.PENDING)
-                    existing_task.result = task.result
-                    existing_task.error = task.error
-                    existing_task.started_at = task.started_at
-                    existing_task.completed_at = task.completed_at
-                else:
-                    # Create new task
-                    db_task = TaskModel(
-                        id=task.id,
-                        session_id=session_id,
-                        target_id=task.target_id,
-                        name=task.name,
-                        task_type=task.task_type,
-                        status=status_map.get(task.status.value, DBTaskStatus.PENDING),
-                        tool=task.tool,
-                        parameters=task.parameters or {},
-                        risk_level=task.risk_level,
-                        result=task.result,
-                        error=task.error,
-                        requires_approval=task.requires_approval,
-                        started_at=task.started_at,
-                        completed_at=task.completed_at,
-                    )
-                    db.add(db_task)
-
-            # Update session status
-            result = await db.execute(
-                select(SessionModel).where(SessionModel.id == session_id)
-            )
-            session = result.scalar_one_or_none()
-            if session:
-                if final_state.workflow_phase == "complete":
-                    session.status = SessionStatus.COMPLETED
-                    session.completed_at = datetime.utcnow()
-                elif final_state.workflow_phase == "error":
-                    session.status = SessionStatus.FAILED
-
-            # Sync findings to database
-            severity_map = {
-                "info": DBSeverityLevel.INFO,
-                "low": DBSeverityLevel.LOW,
-                "medium": DBSeverityLevel.MEDIUM,
-                "high": DBSeverityLevel.HIGH,
-                "critical": DBSeverityLevel.CRITICAL,
-            }
-
-            for finding in final_state.findings:
-                # Check if finding already exists
-                result = await db.execute(
-                    select(FindingModel).where(FindingModel.id == finding.id)
-                )
-                existing_finding = result.scalar_one_or_none()
-
-                if not existing_finding:
-                    # Get target_id from finding's target address
-                    target_id = None
-                    for target in final_state.targets:
-                        if target.address == finding.target:
-                            target_id = target.id
-                            break
-
-                    db_finding = FindingModel(
-                        id=finding.id,
-                        session_id=session_id,
-                        target_id=target_id,
-                        title=finding.title,
-                        description=finding.description,
-                        severity=severity_map.get(finding.severity, DBSeverityLevel.INFO),
-                        category=finding.category,
-                        evidence=finding.evidence,
-                        remediation=finding.remediation,
-                        cve_ids=finding.cve_ids,
-                        cvss_score=finding.cvss_score,
-                        verified=finding.verified,
-                        discovered_at=finding.discovered_at,
-                    )
-                    db.add(db_finding)
-
-            await db.commit()
-
-            logger.info(
-                "Workflow state synced to database",
-                session_id=session_id,
-                tasks_synced=len(final_state.tasks),
-                findings_synced=len(final_state.findings),
-                final_phase=final_state.workflow_phase
-            )
+            await _sync_state_impl(db, session_id, final_state)
 
     except Exception as e:
         logger.error(
@@ -496,15 +517,21 @@ async def session_websocket(
                 task_id = data.get("task_id")
                 approved = data.get("approved", False)
 
-                success = await orchestrator.approve_task(
+                result = await orchestrator.approve_task(
                     session_id, task_id, approved
                 )
 
                 await websocket.send_json({
                     "type": "approval_response",
                     "task_id": task_id,
-                    "success": success
+                    "success": result.get("success", False),
+                    "resumed": result.get("resumed", False),
+                    "error": result.get("error")
                 })
+
+                # If workflow was resumed and completed, sync state to database
+                if result.get("resumed") and result.get("state"):
+                    await sync_state_to_database(session_id, result.get("state"))
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket, session_id)

@@ -47,7 +47,8 @@ class PentestOrchestrator:
         web_agent: Any,
         network_agent: Any,
         memory_system: Any,
-        execution_engine: Any
+        execution_engine: Any,
+        ws_manager: Any = None
     ):
         """
         Set the agent instances for the orchestrator.
@@ -57,7 +58,12 @@ class PentestOrchestrator:
         self.network_agent = network_agent
         self.memory_system = memory_system
         self.execution_engine = execution_engine
+        self.ws_manager = ws_manager
         logger.info("Agents configured for orchestrator")
+
+    def set_ws_manager(self, ws_manager: Any):
+        """Set the WebSocket manager for real-time notifications."""
+        self.ws_manager = ws_manager
 
     def build_workflow(self) -> StateGraph:
         """
@@ -377,8 +383,11 @@ class PentestOrchestrator:
         agent_state.reasoning = reasoning
         agent_state.confidence = 0.85
 
-        # Determine if approval is needed based on risk
-        needs_approval = current_task.risk_level in ["high", "critical"]
+        # Determine if approval is needed based on risk vs config threshold
+        risk_order = ["low", "medium", "high", "critical"]
+        task_risk_idx = risk_order.index(current_task.risk_level) if current_task.risk_level in risk_order else 0
+        max_auto_idx = risk_order.index(settings.max_risk_auto.value)
+        needs_approval = task_risk_idx > max_auto_idx or current_task.requires_approval
 
         updated_tasks = []
         for task in state.tasks:
@@ -429,7 +438,11 @@ class PentestOrchestrator:
         agent_state.reasoning = reasoning
         agent_state.confidence = 0.80
 
-        needs_approval = current_task.risk_level in ["high", "critical"]
+        # Determine if approval is needed based on risk vs config threshold
+        risk_order = ["low", "medium", "high", "critical"]
+        task_risk_idx = risk_order.index(current_task.risk_level) if current_task.risk_level in risk_order else 0
+        max_auto_idx = risk_order.index(settings.max_risk_auto.value)
+        needs_approval = task_risk_idx > max_auto_idx or current_task.requires_approval
 
         updated_tasks = []
         for task in state.tasks:
@@ -474,6 +487,24 @@ class PentestOrchestrator:
 
         Do you approve this operation? [approve/reject]
         """
+
+        # Send WebSocket notification for approval request
+        if self.ws_manager:
+            try:
+                await self.ws_manager.send_approval_request(
+                    session_id=state.session_id,
+                    request_id=current_task.id,
+                    task_name=current_task.name,
+                    risk_level=current_task.risk_level,
+                    description=f"Execute {current_task.tool or current_task.task_type} on target"
+                )
+                logger.info(
+                    "Approval request sent via WebSocket",
+                    session_id=state.session_id,
+                    task_id=current_task.id
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send approval WebSocket notification: {e}")
 
         return {
             "requires_human_input": True,
@@ -998,36 +1029,69 @@ class PentestOrchestrator:
             self.active_sessions[session_id] = state
             raise
 
-    async def approve_task(self, session_id: str, task_id: str, approved: bool) -> bool:
+    async def approve_task(
+        self,
+        session_id: str,
+        task_id: str,
+        approved: bool,
+        resume_workflow: bool = True
+    ) -> Dict[str, Any]:
         """
-        Approve or reject a pending task.
+        Approve or reject a pending task and optionally resume the workflow.
 
         Args:
             session_id: The session ID
             task_id: The task ID to approve/reject
             approved: True to approve, False to reject
+            resume_workflow: Whether to resume the workflow after approval
 
         Returns:
-            Success status
+            Dict with success status and optional final state
         """
         if session_id not in self.active_sessions:
-            return False
+            return {"success": False, "error": "Session not found"}
 
         state = self.active_sessions[session_id]
+        task_found = False
 
         for task in state.tasks:
             if task.id == task_id:
                 task.status = TaskStatus.APPROVED if approved else TaskStatus.REJECTED
                 task.approved_by = "user"
                 state.requires_human_input = False
+                task_found = True
                 logger.info(
                     "Task approval updated",
                     task_id=task_id,
                     approved=approved
                 )
-                return True
+                break
 
-        return False
+        if not task_found:
+            return {"success": False, "error": "Task not found"}
+
+        # Send WebSocket notification
+        if self.ws_manager:
+            try:
+                await self.ws_manager.send_to_session(session_id, {
+                    "type": "approval_response",
+                    "task_id": task_id,
+                    "approved": approved,
+                    "status": "approved" if approved else "rejected"
+                })
+            except Exception as e:
+                logger.warning(f"Failed to send approval response: {e}")
+
+        # Resume workflow if requested
+        if resume_workflow and approved:
+            try:
+                final_state = await self.run_session(session_id)
+                return {"success": True, "resumed": True, "state": final_state}
+            except Exception as e:
+                logger.error(f"Failed to resume workflow: {e}")
+                return {"success": True, "resumed": False, "error": str(e)}
+
+        return {"success": True, "resumed": False}
 
     def get_session_state(self, session_id: str) -> Optional[PentestState]:
         """Get the current state of a session."""

@@ -80,6 +80,9 @@ async def lifespan(app: FastAPI):
     ws_manager = WebSocketManager()
     set_ws_manager(ws_manager)
 
+    # Connect WebSocket manager to orchestrator for real-time notifications
+    orchestrator.set_ws_manager(ws_manager)
+
     logger.info("Cerebrus API server started successfully")
 
     yield
