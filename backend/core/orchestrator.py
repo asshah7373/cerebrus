@@ -512,23 +512,79 @@ class PentestOrchestrator:
             tool=current_task.tool
         )
 
-        # Update task status
+        # Execute the task based on type
+        result = None
+        error = None
+
+        try:
+            if self.execution_engine:
+                # Use the MCP execution engine if available
+                result = await self.execution_engine.execute_task(current_task)
+            else:
+                # Placeholder execution - simulate task completion
+                # In production, this would call actual security tools
+                target = None
+                for t in state.targets:
+                    if t.id == current_task.target_id:
+                        target = t
+                        break
+
+                if current_task.task_type == "recon":
+                    result = {
+                        "status": "completed",
+                        "task_type": "reconnaissance",
+                        "target": target.address if target else "unknown",
+                        "findings": [
+                            f"Target {target.address if target else 'unknown'} identified",
+                            "Awaiting full MCP tool integration for detailed reconnaissance"
+                        ],
+                        "next_steps": ["vulnerability_scan", "service_enumeration"]
+                    }
+                elif current_task.task_type == "scan":
+                    result = {
+                        "status": "completed",
+                        "task_type": "scan",
+                        "target": target.address if target else "unknown",
+                        "tool": current_task.tool or "default_scanner",
+                        "findings": [
+                            "Scan initiated - awaiting MCP tool integration",
+                        ],
+                        "vulnerabilities_found": 0
+                    }
+                else:
+                    result = {
+                        "status": "completed",
+                        "task_type": current_task.task_type,
+                        "message": "Task completed - awaiting full tool integration"
+                    }
+
+                logger.info(
+                    "Task executed (placeholder)",
+                    task_id=current_task.id,
+                    result_status=result.get("status")
+                )
+        except Exception as e:
+            error = str(e)
+            logger.error("Task execution failed", task_id=current_task.id, error=error)
+            result = {"status": "failed", "error": error}
+
+        # Update task with result
         updated_tasks = []
         for task in state.tasks:
             if task.id == current_task.id:
                 task.status = TaskStatus.IN_PROGRESS
                 task.started_at = datetime.utcnow()
+                task.result = result
+                if error:
+                    task.error = error
             updated_tasks.append(task)
-
-        # Execution happens in the execution engine (mcp_engine.py)
-        # This node prepares the state for execution
 
         return {
             "tasks": updated_tasks,
             "workflow_phase": "execution",
             "messages": [{
                 "role": "system",
-                "content": f"Executing: {current_task.name}",
+                "content": f"Executed: {current_task.name} - {result.get('status', 'unknown')}",
                 "timestamp": datetime.utcnow().isoformat()
             }]
         }
@@ -537,18 +593,28 @@ class PentestOrchestrator:
         """Analyze execution results and generate findings."""
         current_task = state.get_current_task()
 
-        if not current_task or not current_task.result:
-            return {"next_action": "continue"}
+        if not current_task:
+            # No current task - nothing to analyze
+            return {
+                "workflow_phase": "analysis",
+                "messages": [{
+                    "role": "system",
+                    "content": "No task to analyze",
+                    "timestamp": datetime.utcnow().isoformat()
+                }]
+            }
 
-        logger.info("Analyzing results", task_id=current_task.id)
+        logger.info("Analyzing results", task_id=current_task.id, has_result=bool(current_task.result))
 
-        # Mark task as completed
+        # Mark task as completed (even if no result, to prevent infinite loops)
         updated_tasks = []
         completed_tasks = list(state.completed_tasks)
 
+        task_status = TaskStatus.COMPLETED if current_task.result else TaskStatus.FAILED
+
         for task in state.tasks:
             if task.id == current_task.id:
-                task.status = TaskStatus.COMPLETED
+                task.status = task_status
                 task.completed_at = datetime.utcnow()
                 completed_tasks.append(task.id)
             updated_tasks.append(task)
@@ -556,6 +622,13 @@ class PentestOrchestrator:
         # Move to next task in queue
         task_queue = [t for t in state.task_queue if t != current_task.id]
         next_task_id = task_queue[0] if task_queue else None
+
+        logger.info(
+            "Task analysis complete",
+            task_id=current_task.id,
+            status=task_status.value,
+            remaining_tasks=len(task_queue)
+        )
 
         return {
             "tasks": updated_tasks,
@@ -565,7 +638,7 @@ class PentestOrchestrator:
             "workflow_phase": "analysis",
             "messages": [{
                 "role": "system",
-                "content": f"Analysis complete for: {current_task.name}",
+                "content": f"Analysis complete for: {current_task.name} (status: {task_status.value})",
                 "timestamp": datetime.utcnow().isoformat()
             }]
         }
@@ -687,18 +760,49 @@ class PentestOrchestrator:
 
         state = self.active_sessions[session_id]
 
+        logger.info(
+            "Running workflow",
+            session_id=session_id,
+            target_count=len(state.targets),
+            objective=state.user_objective
+        )
+
         # Compile and run the graph
         app = self.graph.compile(checkpointer=self.checkpointer)
 
-        config = {"configurable": {"thread_id": session_id}}
+        # Config with higher recursion limit for complex workflows
+        config = {
+            "configurable": {"thread_id": session_id},
+            "recursion_limit": 100  # Allow more iterations for complex pentests
+        }
 
-        # Run the workflow
-        final_state = await app.ainvoke(state.model_dump(), config)
+        try:
+            # Run the workflow
+            final_state = await app.ainvoke(state.model_dump(), config)
 
-        # Update stored state
-        self.active_sessions[session_id] = PentestState(**final_state)
+            # Update stored state
+            self.active_sessions[session_id] = PentestState(**final_state)
 
-        return self.active_sessions[session_id]
+            logger.info(
+                "Workflow completed",
+                session_id=session_id,
+                phase=final_state.get("workflow_phase", "unknown"),
+                completed_tasks=len(final_state.get("completed_tasks", []))
+            )
+
+            return self.active_sessions[session_id]
+
+        except Exception as e:
+            logger.error(
+                "Workflow failed",
+                session_id=session_id,
+                error=str(e)
+            )
+            # Update state to reflect error
+            state.errors.append(str(e))
+            state.workflow_phase = "error"
+            self.active_sessions[session_id] = state
+            raise
 
     async def approve_task(self, session_id: str, task_id: str, approved: bool) -> bool:
         """
