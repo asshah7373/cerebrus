@@ -51,6 +51,7 @@ class SessionListResponse(BaseModel):
 @router.post("", response_model=SessionResponse)
 async def create_session(
     request: CreateSessionRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -58,29 +59,59 @@ async def create_session(
 
     A session represents a complete pentesting engagement with
     one or more targets and an objective.
+
+    If targets are provided, the session will automatically start running.
     """
     session_id = str(uuid.uuid4())
+
+    # Determine initial status based on whether targets are provided
+    initial_status = SessionStatus.RUNNING if request.targets else SessionStatus.CREATED
 
     session = SessionModel(
         id=session_id,
         name=request.name,
         objective=request.objective,
-        status=SessionStatus.CREATED,
+        status=initial_status,
         automation_level=request.automation_level,
-        constraints=request.constraints
+        constraints=request.constraints,
+        started_at=datetime.utcnow() if request.targets else None
     )
 
     db.add(session)
+
+    # Add targets to the database
+    if request.targets:
+        from ...models.schemas import TargetModel
+        for target_data in request.targets:
+            target = TargetModel(
+                id=str(uuid.uuid4()),
+                session_id=session_id,
+                name=target_data.get("name", target_data.get("address")),
+                target_type=target_data.get("type", "web"),
+                address=target_data.get("address"),
+                authorized=target_data.get("authorized", True),  # Default to authorized for user-provided targets
+            )
+            db.add(target)
+
     await db.commit()
 
     # Initialize session in orchestrator with the same session_id
+    # Mark targets as authorized since user is providing them
+    orchestrator_targets = [
+        {**t, "authorized": True} for t in request.targets
+    ] if request.targets else []
+
     orchestrator = get_orchestrator()
     await orchestrator.start_session(
         objective=request.objective,
-        targets=request.targets,
+        targets=orchestrator_targets,
         constraints=request.constraints,
         session_id=session_id
     )
+
+    # If targets were provided, automatically start the workflow
+    if request.targets:
+        background_tasks.add_task(orchestrator.run_session, session_id)
 
     return SessionResponse(
         id=session.id,
@@ -88,7 +119,9 @@ async def create_session(
         objective=session.objective,
         status=session.status.value,
         automation_level=session.automation_level,
-        created_at=session.created_at
+        created_at=session.created_at,
+        started_at=session.started_at,
+        target_count=len(request.targets) if request.targets else 0
     )
 
 
