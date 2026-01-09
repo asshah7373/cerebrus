@@ -517,7 +517,7 @@ class PentestOrchestrator:
         error = None
 
         try:
-            if self.execution_engine:
+            if self.execution_engine and hasattr(self.execution_engine, 'execute_task'):
                 # Use the MCP execution engine if available
                 result = await self.execution_engine.execute_task(current_task)
             else:

@@ -12,11 +12,110 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from ...models.database import get_db
-from ...models.schemas import SessionModel, SessionStatus
+from ...models.database import get_db, async_session_factory
+from ...models.schemas import SessionModel, SessionStatus, TaskModel, TaskStatus as DBTaskStatus
 from ..dependencies import get_orchestrator, get_ws_manager
+import structlog
 
 router = APIRouter()
+logger = structlog.get_logger()
+
+
+async def run_workflow_and_sync(session_id: str, orchestrator):
+    """
+    Run the orchestrator workflow and sync state back to database.
+    This runs as a background task.
+    """
+    try:
+        # Run the workflow
+        final_state = await orchestrator.run_session(session_id)
+
+        # Sync tasks to database
+        async with async_session_factory() as db:
+            # Map orchestrator task status to database status
+            status_map = {
+                "pending": DBTaskStatus.PENDING,
+                "in_progress": DBTaskStatus.IN_PROGRESS,
+                "waiting_approval": DBTaskStatus.WAITING_APPROVAL,
+                "approved": DBTaskStatus.APPROVED,
+                "rejected": DBTaskStatus.REJECTED,
+                "completed": DBTaskStatus.COMPLETED,
+                "failed": DBTaskStatus.FAILED,
+            }
+
+            for task in final_state.tasks:
+                # Check if task already exists
+                result = await db.execute(
+                    select(TaskModel).where(TaskModel.id == task.id)
+                )
+                existing_task = result.scalar_one_or_none()
+
+                if existing_task:
+                    # Update existing task
+                    existing_task.status = status_map.get(task.status.value, DBTaskStatus.PENDING)
+                    existing_task.result = task.result
+                    existing_task.error = task.error
+                    existing_task.started_at = task.started_at
+                    existing_task.completed_at = task.completed_at
+                else:
+                    # Create new task
+                    db_task = TaskModel(
+                        id=task.id,
+                        session_id=session_id,
+                        target_id=task.target_id,
+                        name=task.name,
+                        task_type=task.task_type,
+                        status=status_map.get(task.status.value, DBTaskStatus.PENDING),
+                        tool=task.tool,
+                        parameters=task.parameters or {},
+                        risk_level=task.risk_level,
+                        result=task.result,
+                        error=task.error,
+                        requires_approval=task.requires_approval,
+                        started_at=task.started_at,
+                        completed_at=task.completed_at,
+                    )
+                    db.add(db_task)
+
+            # Update session status
+            result = await db.execute(
+                select(SessionModel).where(SessionModel.id == session_id)
+            )
+            session = result.scalar_one_or_none()
+            if session:
+                if final_state.workflow_phase == "complete":
+                    session.status = SessionStatus.COMPLETED
+                    session.completed_at = datetime.utcnow()
+                elif final_state.workflow_phase == "error":
+                    session.status = SessionStatus.FAILED
+
+            await db.commit()
+
+            logger.info(
+                "Workflow state synced to database",
+                session_id=session_id,
+                tasks_synced=len(final_state.tasks),
+                final_phase=final_state.workflow_phase
+            )
+
+    except Exception as e:
+        logger.error(
+            "Failed to run workflow or sync state",
+            session_id=session_id,
+            error=str(e)
+        )
+        # Try to update session status to failed
+        try:
+            async with async_session_factory() as db:
+                result = await db.execute(
+                    select(SessionModel).where(SessionModel.id == session_id)
+                )
+                session = result.scalar_one_or_none()
+                if session:
+                    session.status = SessionStatus.FAILED
+                    await db.commit()
+        except Exception:
+            pass
 
 
 class CreateSessionRequest(BaseModel):
@@ -111,7 +210,7 @@ async def create_session(
 
     # If targets were provided, automatically start the workflow
     if request.targets:
-        background_tasks.add_task(orchestrator.run_session, session_id)
+        background_tasks.add_task(run_workflow_and_sync, session_id, orchestrator)
 
     return SessionResponse(
         id=session.id,
@@ -229,9 +328,9 @@ async def start_session(
     session.started_at = datetime.utcnow()
     await db.commit()
 
-    # Run session in background
+    # Run session in background with state sync
     orchestrator = get_orchestrator()
-    background_tasks.add_task(orchestrator.run_session, session_id)
+    background_tasks.add_task(run_workflow_and_sync, session_id, orchestrator)
 
     return {"status": "started", "session_id": session_id}
 
