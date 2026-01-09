@@ -618,7 +618,8 @@ class PentestOrchestrator:
         self,
         objective: str,
         targets: List[Dict[str, Any]],
-        constraints: List[str] = None
+        constraints: List[str] = None,
+        session_id: str = None
     ) -> str:
         """
         Start a new pentesting session.
@@ -627,11 +628,13 @@ class PentestOrchestrator:
             objective: The pentesting objective (e.g., "Find vulnerabilities in web app")
             targets: List of target configurations
             constraints: Optional list of constraints (e.g., "No destructive testing")
+            session_id: Optional session ID (if not provided, one will be generated)
 
         Returns:
             Session ID
         """
-        session_id = str(uuid.uuid4())
+        if session_id is None:
+            session_id = str(uuid.uuid4())
 
         # Create target objects
         target_objects = [

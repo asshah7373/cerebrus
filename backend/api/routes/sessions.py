@@ -73,12 +73,13 @@ async def create_session(
     db.add(session)
     await db.commit()
 
-    # Initialize session in orchestrator
+    # Initialize session in orchestrator with the same session_id
     orchestrator = get_orchestrator()
     await orchestrator.start_session(
         objective=request.objective,
         targets=request.targets,
-        constraints=request.constraints
+        constraints=request.constraints,
+        session_id=session_id
     )
 
     return SessionResponse(
