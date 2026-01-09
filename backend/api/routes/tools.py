@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 
-from ..main import get_mcp_engine
+from ..dependencies import get_mcp_engine
 from ...tools.mcp_engine import ExecutionRequest
 
 router = APIRouter()

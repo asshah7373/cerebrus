@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from ...models.database import get_db
 from ...models.schemas import TaskModel, TaskStatus, SessionModel
-from ..main import get_orchestrator
+from ..dependencies import get_orchestrator
 
 router = APIRouter()
 

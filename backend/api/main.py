@@ -17,23 +17,30 @@ from ..memory.memory_manager import MemoryManager
 from ..agents.web_agent import WebReasoningAgent
 from ..agents.network_agent import NetworkReasoningAgent
 
-from .routes import sessions, targets, tasks, findings, tools, settings as settings_routes
 from .websocket import WebSocketManager
+from .dependencies import (
+    set_orchestrator,
+    set_mcp_engine,
+    set_memory_manager,
+    set_ws_manager,
+    get_orchestrator as _get_orchestrator,
+    get_mcp_engine as _get_mcp_engine,
+    get_memory_manager as _get_memory_manager,
+    get_ws_manager as _get_ws_manager,
+)
 
 logger = structlog.get_logger()
 
 
-# Global instances
-orchestrator: PentestOrchestrator = None
-mcp_engine: MCPEngine = None
-memory_manager: MemoryManager = None
-ws_manager: WebSocketManager = None
+# Local references for health check
+_local_orchestrator = None
+_local_mcp_engine = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global orchestrator, mcp_engine, memory_manager, ws_manager
+    global _local_orchestrator, _local_mcp_engine
 
     # Startup
     logger.info("Starting Cerebrus API server")
@@ -47,8 +54,11 @@ async def lifespan(app: FastAPI):
     # Initialize components
     mcp_engine = MCPEngine()
     register_all_tools(mcp_engine)
+    set_mcp_engine(mcp_engine)
+    _local_mcp_engine = mcp_engine
 
     memory_manager = MemoryManager()
+    set_memory_manager(memory_manager)
 
     # Initialize agents
     web_agent = WebReasoningAgent(mcp_engine, memory_manager)
@@ -63,9 +73,12 @@ async def lifespan(app: FastAPI):
         execution_engine=mcp_engine
     )
     orchestrator.build_workflow()
+    set_orchestrator(orchestrator)
+    _local_orchestrator = orchestrator
 
     # Initialize WebSocket manager
     ws_manager = WebSocketManager()
+    set_ws_manager(ws_manager)
 
     logger.info("Cerebrus API server started successfully")
 
@@ -93,6 +106,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Import routes here to avoid circular imports
+    from .routes import sessions, targets, tasks, findings, tools, settings as settings_routes
+
     # Include routers
     app.include_router(sessions.router, prefix="/api/sessions", tags=["Sessions"])
     app.include_router(targets.router, prefix="/api/targets", tags=["Targets"])
@@ -109,8 +125,8 @@ def create_app() -> FastAPI:
             "version": settings.app_version,
             "components": {
                 "database": "connected",
-                "mcp_engine": "ready" if mcp_engine else "not_initialized",
-                "orchestrator": "ready" if orchestrator else "not_initialized"
+                "mcp_engine": "ready" if _local_mcp_engine else "not_initialized",
+                "orchestrator": "ready" if _local_orchestrator else "not_initialized"
             }
         }
 
@@ -130,30 +146,10 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-# Dependency injection helpers
-def get_orchestrator() -> PentestOrchestrator:
-    """Get the orchestrator instance."""
-    if orchestrator is None:
-        raise HTTPException(status_code=503, detail="Orchestrator not initialized")
-    return orchestrator
-
-
-def get_mcp_engine() -> MCPEngine:
-    """Get the MCP engine instance."""
-    if mcp_engine is None:
-        raise HTTPException(status_code=503, detail="MCP Engine not initialized")
-    return mcp_engine
-
-
-def get_memory_manager() -> MemoryManager:
-    """Get the memory manager instance."""
-    if memory_manager is None:
-        raise HTTPException(status_code=503, detail="Memory Manager not initialized")
-    return memory_manager
-
-
-def get_ws_manager() -> WebSocketManager:
-    """Get the WebSocket manager instance."""
-    if ws_manager is None:
-        raise HTTPException(status_code=503, detail="WebSocket Manager not initialized")
-    return ws_manager
+# Re-export dependency injection helpers for backwards compatibility
+from .dependencies import (
+    get_orchestrator,
+    get_mcp_engine,
+    get_memory_manager,
+    get_ws_manager,
+)
