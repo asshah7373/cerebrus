@@ -109,7 +109,7 @@ async def list_sessions(
 
     query = query.limit(limit).offset(offset)
     result = await db.execute(query)
-    sessions = result.scalars().all()
+    sessions = result.unique().scalars().all()
 
     # Get counts
     count_query = select(SessionModel)
@@ -150,7 +150,7 @@ async def get_session(
             selectinload(SessionModel.findings)
         ).where(SessionModel.id == session_id)
     )
-    session = result.scalar_one_or_none()
+    session = result.unique().scalar_one_or_none()
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
