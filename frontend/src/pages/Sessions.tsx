@@ -149,6 +149,7 @@ function CreateSessionModal({
 
 function SessionCard({ session }: { session: Session }) {
   const queryClient = useQueryClient()
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
   const startMutation = useMutation({
     mutationFn: () => api.post(`/api/sessions/${session.id}/start`),
@@ -162,6 +163,11 @@ function SessionCard({ session }: { session: Session }) {
 
   const stopMutation = useMutation({
     mutationFn: () => api.post(`/api/sessions/${session.id}/stop`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: () => api.delete(`/api/sessions/${session.id}`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
   })
 
@@ -243,7 +249,47 @@ function SessionCard({ session }: { session: Session }) {
             <ExternalLink className="w-4 h-4" />
             View Details
           </Link>
+
+          {session.status !== 'running' && (
+            <button
+              onClick={() => setShowDeleteConfirm(true)}
+              className="flex items-center gap-1 px-3 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white text-sm rounded-lg transition-colors"
+              title="Delete session"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
         </div>
+
+        {/* Delete confirmation modal */}
+        {showDeleteConfirm && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowDeleteConfirm(false)}>
+            <div className="bg-gray-800 rounded-xl p-6 max-w-sm mx-4 border border-gray-700" onClick={e => e.stopPropagation()}>
+              <h3 className="text-lg font-semibold text-white mb-2">Delete Session?</h3>
+              <p className="text-gray-400 text-sm mb-4">
+                Are you sure you want to delete "{session.name}"? This will remove all associated targets, tasks, and findings.
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setShowDeleteConfirm(false)}
+                  className="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    deleteMutation.mutate()
+                    setShowDeleteConfirm(false)
+                  }}
+                  disabled={deleteMutation.isPending}
+                  className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors disabled:opacity-50"
+                >
+                  {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

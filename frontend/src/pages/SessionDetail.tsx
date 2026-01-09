@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Play,
@@ -11,7 +11,8 @@ import {
   XCircle,
   Clock,
   Terminal,
-  Shield
+  Shield,
+  Trash2
 } from 'lucide-react'
 import { api } from '../utils/api'
 import { useWebSocket } from '../hooks/useWebSocket'
@@ -142,8 +143,10 @@ function FindingCard({ finding }: { finding: any }) {
 
 export default function SessionDetail() {
   const { sessionId } = useParams<{ sessionId: string }>()
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [activeTab, setActiveTab] = useState<'overview' | 'tasks' | 'findings' | 'logs'>('overview')
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
   // WebSocket connection for real-time updates
   const { messages, isConnected } = useWebSocket(sessionId || '')
@@ -168,6 +171,14 @@ export default function SessionDetail() {
       api.post(`/api/tasks/${taskId}/approve`, { approved }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['tasks', sessionId] })
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: () => api.delete(`/api/sessions/${sessionId}`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['sessions'] })
+      navigate('/sessions')
     },
   })
 
@@ -221,7 +232,48 @@ export default function SessionDetail() {
           </div>
           <p className="text-gray-400">{session.objective}</p>
         </div>
+
+        {/* Delete button */}
+        {session.status !== 'running' && (
+          <button
+            onClick={() => setShowDeleteConfirm(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded-lg transition-colors"
+          >
+            <Trash2 className="w-4 h-4" />
+            Delete
+          </button>
+        )}
       </div>
+
+      {/* Delete confirmation modal */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowDeleteConfirm(false)}>
+          <div className="bg-gray-800 rounded-xl p-6 max-w-sm mx-4 border border-gray-700" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold text-white mb-2">Delete Session?</h3>
+            <p className="text-gray-400 text-sm mb-4">
+              Are you sure you want to delete "{session.name}"? This will remove all associated targets, tasks, and findings.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowDeleteConfirm(false)}
+                className="flex-1 px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  deleteMutation.mutate()
+                  setShowDeleteConfirm(false)
+                }}
+                disabled={deleteMutation.isPending}
+                className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition-colors disabled:opacity-50"
+              >
+                {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="border-b border-gray-700">
