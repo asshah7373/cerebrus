@@ -10,6 +10,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from ...models.database import get_db
 from ...models.schemas import SessionModel, SessionStatus
@@ -98,7 +99,10 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db)
 ):
     """List all pentesting sessions."""
-    query = select(SessionModel).order_by(SessionModel.created_at.desc())
+    query = select(SessionModel).options(
+        selectinload(SessionModel.targets),
+        selectinload(SessionModel.findings)
+    ).order_by(SessionModel.created_at.desc())
 
     if status:
         query = query.where(SessionModel.status == SessionStatus(status))
@@ -125,8 +129,8 @@ async def list_sessions(
                 created_at=s.created_at,
                 started_at=s.started_at,
                 completed_at=s.completed_at,
-                target_count=len(s.targets),
-                finding_count=len(s.findings)
+                target_count=len(s.targets) if s.targets else 0,
+                finding_count=len(s.findings) if s.findings else 0
             )
             for s in sessions
         ],
@@ -141,7 +145,10 @@ async def get_session(
 ):
     """Get a specific session by ID."""
     result = await db.execute(
-        select(SessionModel).where(SessionModel.id == session_id)
+        select(SessionModel).options(
+            selectinload(SessionModel.targets),
+            selectinload(SessionModel.findings)
+        ).where(SessionModel.id == session_id)
     )
     session = result.scalar_one_or_none()
 
@@ -157,8 +164,8 @@ async def get_session(
         created_at=session.created_at,
         started_at=session.started_at,
         completed_at=session.completed_at,
-        target_count=len(session.targets),
-        finding_count=len(session.findings)
+        target_count=len(session.targets) if session.targets else 0,
+        finding_count=len(session.findings) if session.findings else 0
     )
 
 
