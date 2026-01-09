@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from ...models.database import get_db, async_session_factory
-from ...models.schemas import SessionModel, SessionStatus, TaskModel, TaskStatus as DBTaskStatus
+from ...models.schemas import SessionModel, SessionStatus, TaskModel, TaskStatus as DBTaskStatus, FindingModel, SeverityLevel as DBSeverityLevel
 from ..dependencies import get_orchestrator, get_ws_manager
 import structlog
 
@@ -89,12 +89,54 @@ async def run_workflow_and_sync(session_id: str, orchestrator):
                 elif final_state.workflow_phase == "error":
                     session.status = SessionStatus.FAILED
 
+            # Sync findings to database
+            severity_map = {
+                "info": DBSeverityLevel.INFO,
+                "low": DBSeverityLevel.LOW,
+                "medium": DBSeverityLevel.MEDIUM,
+                "high": DBSeverityLevel.HIGH,
+                "critical": DBSeverityLevel.CRITICAL,
+            }
+
+            for finding in final_state.findings:
+                # Check if finding already exists
+                result = await db.execute(
+                    select(FindingModel).where(FindingModel.id == finding.id)
+                )
+                existing_finding = result.scalar_one_or_none()
+
+                if not existing_finding:
+                    # Get target_id from finding's target address
+                    target_id = None
+                    for target in final_state.targets:
+                        if target.address == finding.target:
+                            target_id = target.id
+                            break
+
+                    db_finding = FindingModel(
+                        id=finding.id,
+                        session_id=session_id,
+                        target_id=target_id,
+                        title=finding.title,
+                        description=finding.description,
+                        severity=severity_map.get(finding.severity, DBSeverityLevel.INFO),
+                        category=finding.category,
+                        evidence=finding.evidence,
+                        remediation=finding.remediation,
+                        cve_ids=finding.cve_ids,
+                        cvss_score=finding.cvss_score,
+                        verified=finding.verified,
+                        discovered_at=finding.discovered_at,
+                    )
+                    db.add(db_finding)
+
             await db.commit()
 
             logger.info(
                 "Workflow state synced to database",
                 session_id=session_id,
                 tasks_synced=len(final_state.tasks),
+                findings_synced=len(final_state.findings),
                 final_phase=final_state.workflow_phase
             )
 

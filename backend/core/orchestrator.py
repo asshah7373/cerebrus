@@ -9,7 +9,7 @@ import structlog
 from datetime import datetime
 import uuid
 
-from .state import PentestState, Task, TaskStatus, Target, AgentState
+from .state import PentestState, Task, TaskStatus, Target, AgentState, Finding, SeverityLevel
 from ..config import settings, RiskLevel
 
 logger = structlog.get_logger()
@@ -619,6 +619,17 @@ class PentestOrchestrator:
                 completed_tasks.append(task.id)
             updated_tasks.append(task)
 
+        # Generate findings from tool results
+        new_findings = []
+        if current_task.result and current_task.result.get("status") == "success":
+            new_findings = self._generate_findings_from_result(current_task, state)
+            if new_findings:
+                logger.info(
+                    "Generated findings from task",
+                    task_id=current_task.id,
+                    finding_count=len(new_findings)
+                )
+
         # Move to next task in queue
         task_queue = [t for t in state.task_queue if t != current_task.id]
         next_task_id = task_queue[0] if task_queue else None
@@ -627,21 +638,204 @@ class PentestOrchestrator:
             "Task analysis complete",
             task_id=current_task.id,
             status=task_status.value,
-            remaining_tasks=len(task_queue)
+            remaining_tasks=len(task_queue),
+            new_findings=len(new_findings)
         )
+
+        # Combine existing findings with new ones
+        all_findings = list(state.findings) + new_findings
 
         return {
             "tasks": updated_tasks,
             "completed_tasks": completed_tasks,
             "task_queue": task_queue,
             "current_task_id": next_task_id,
+            "findings": all_findings,
             "workflow_phase": "analysis",
             "messages": [{
                 "role": "system",
-                "content": f"Analysis complete for: {current_task.name} (status: {task_status.value})",
+                "content": f"Analysis complete for: {current_task.name} (status: {task_status.value}, findings: {len(new_findings)})",
                 "timestamp": datetime.utcnow().isoformat()
             }]
         }
+
+    def _generate_findings_from_result(self, task: Task, state: PentestState) -> List[Finding]:
+        """
+        Parse tool results and generate findings.
+        Follows Shannon's "Proof by Exploitation" methodology.
+        """
+        findings = []
+        result = task.result
+        if not result:
+            return findings
+
+        parsed_data = result.get("parsed_data", {})
+        output = result.get("output", "")
+
+        # Get target info
+        target_address = task.parameters.get("target_address", "unknown")
+        for t in state.targets:
+            if t.id == task.target_id:
+                target_address = t.address
+                break
+
+        # Parse based on task type and tool
+        if task.task_type == "recon":
+            findings.extend(self._parse_recon_findings(parsed_data, output, target_address, task))
+        elif task.task_type == "scan":
+            findings.extend(self._parse_scan_findings(parsed_data, output, target_address, task))
+
+        return findings
+
+    def _parse_recon_findings(self, parsed_data: Dict, output: str, target: str, task: Task) -> List[Finding]:
+        """Parse reconnaissance results into findings."""
+        findings = []
+
+        # WhatWeb technology detection
+        if "technologies" in parsed_data or "plugins" in parsed_data:
+            technologies = parsed_data.get("technologies", parsed_data.get("plugins", {}))
+            if technologies:
+                tech_list = []
+                for tech_name, tech_info in technologies.items():
+                    if isinstance(tech_info, dict):
+                        version = tech_info.get("version", [""])[0] if tech_info.get("version") else ""
+                        tech_list.append(f"{tech_name} {version}".strip())
+                    else:
+                        tech_list.append(tech_name)
+
+                findings.append(Finding(
+                    id=str(uuid.uuid4()),
+                    title=f"Technology Stack Identified: {target}",
+                    description=f"The following technologies were detected on {target}:\n" + "\n".join(f"- {t}" for t in tech_list[:10]),
+                    severity=SeverityLevel.INFO,
+                    category="Information Disclosure",
+                    target=target,
+                    evidence=f"WhatWeb scan results:\n{output[:1000]}",
+                    remediation="Review exposed technologies and ensure they are up-to-date. Remove unnecessary version headers.",
+                    discovered_at=datetime.utcnow()
+                ))
+
+        # Curl header analysis
+        if "headers" in parsed_data:
+            headers = parsed_data["headers"]
+
+            # Check for security headers
+            missing_security_headers = []
+            if "x-frame-options" not in headers:
+                missing_security_headers.append("X-Frame-Options")
+            if "x-content-type-options" not in headers:
+                missing_security_headers.append("X-Content-Type-Options")
+            if "content-security-policy" not in headers:
+                missing_security_headers.append("Content-Security-Policy")
+            if "strict-transport-security" not in headers:
+                missing_security_headers.append("Strict-Transport-Security")
+
+            if missing_security_headers:
+                findings.append(Finding(
+                    id=str(uuid.uuid4()),
+                    title=f"Missing Security Headers: {target}",
+                    description=f"The following security headers are missing: {', '.join(missing_security_headers)}",
+                    severity=SeverityLevel.LOW,
+                    category="Misconfiguration",
+                    target=target,
+                    evidence=f"Response headers: {headers}",
+                    remediation="Implement the missing security headers to improve security posture.",
+                    discovered_at=datetime.utcnow()
+                ))
+
+            # Check server version disclosure
+            if "server" in headers:
+                server_header = headers["server"]
+                findings.append(Finding(
+                    id=str(uuid.uuid4()),
+                    title=f"Server Version Disclosed: {target}",
+                    description=f"The server is disclosing version information: {server_header}",
+                    severity=SeverityLevel.INFO,
+                    category="Information Disclosure",
+                    target=target,
+                    evidence=f"Server header: {server_header}",
+                    remediation="Configure the web server to suppress version information in headers.",
+                    discovered_at=datetime.utcnow()
+                ))
+
+        return findings
+
+    def _parse_scan_findings(self, parsed_data: Dict, output: str, target: str, task: Task) -> List[Finding]:
+        """Parse vulnerability scan results into findings."""
+        findings = []
+
+        # Nikto findings
+        if "findings" in parsed_data:
+            for item in parsed_data["findings"][:20]:  # Limit to 20 findings
+                message = item.get("message", "") if isinstance(item, dict) else str(item)
+                if message:
+                    # Determine severity based on content
+                    severity = SeverityLevel.INFO
+                    if any(kw in message.lower() for kw in ["vulnerability", "vuln", "critical", "exploit"]):
+                        severity = SeverityLevel.HIGH
+                    elif any(kw in message.lower() for kw in ["outdated", "old version", "default"]):
+                        severity = SeverityLevel.MEDIUM
+                    elif any(kw in message.lower() for kw in ["disclosed", "information", "detected"]):
+                        severity = SeverityLevel.LOW
+
+                    findings.append(Finding(
+                        id=str(uuid.uuid4()),
+                        title=f"Nikto Finding: {message[:60]}{'...' if len(message) > 60 else ''}",
+                        description=message,
+                        severity=severity,
+                        category="Web Vulnerability",
+                        target=target,
+                        evidence=f"Nikto scan output",
+                        remediation="Review and address the identified issue.",
+                        discovered_at=datetime.utcnow()
+                    ))
+
+        # Nmap port/service findings
+        if "hosts" in parsed_data:
+            for host in parsed_data["hosts"]:
+                ports = host.get("ports", [])
+                for port_info in ports:
+                    if port_info.get("state") == "open":
+                        service = port_info.get("service", {})
+                        port_num = port_info.get("portid", "?")
+                        service_name = service.get("name", "unknown") if service else "unknown"
+                        service_version = service.get("version", "") if service else ""
+
+                        findings.append(Finding(
+                            id=str(uuid.uuid4()),
+                            title=f"Open Port {port_num}/{service_name}: {target}",
+                            description=f"Port {port_num} is open running {service_name} {service_version}".strip(),
+                            severity=SeverityLevel.INFO,
+                            category="Port Discovery",
+                            target=target,
+                            evidence=f"Nmap scan: port {port_num}, service: {service_name}, version: {service_version}",
+                            remediation="Verify this port/service is required. Close unnecessary ports.",
+                            discovered_at=datetime.utcnow()
+                        ))
+
+        # Gobuster/FFuf directory findings
+        if "discovered" in parsed_data:
+            interesting_paths = []
+            for item in parsed_data["discovered"][:20]:
+                path = item.get("path", item.get("url", ""))
+                status = item.get("status", "")
+                if path:
+                    interesting_paths.append(f"{path} (HTTP {status})")
+
+            if interesting_paths:
+                findings.append(Finding(
+                    id=str(uuid.uuid4()),
+                    title=f"Discovered Paths: {target}",
+                    description=f"Directory/file enumeration found:\n" + "\n".join(f"- {p}" for p in interesting_paths),
+                    severity=SeverityLevel.INFO,
+                    category="Information Disclosure",
+                    target=target,
+                    evidence=f"Enumeration results",
+                    remediation="Review discovered paths for sensitive information. Restrict access where appropriate.",
+                    discovered_at=datetime.utcnow()
+                ))
+
+        return findings
 
     async def _update_memory_node(self, state: PentestState) -> Dict[str, Any]:
         """Update the memory system with new information."""

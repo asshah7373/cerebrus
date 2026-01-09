@@ -66,7 +66,7 @@ class Settings(BaseSettings):
         description="Default automation level for operations"
     )
     max_risk_auto: RiskLevel = Field(
-        default=RiskLevel.LOW,
+        default=RiskLevel.MEDIUM,
         description="Maximum risk level for automatic execution"
     )
     require_authorization: bool = Field(
@@ -121,7 +121,7 @@ RISK_DESCRIPTIONS = {
         "name": "Medium Risk",
         "description": "Active scanning and enumeration",
         "examples": ["Port scanning", "Service detection", "Directory brute-forcing"],
-        "auto_approve": False
+        "auto_approve": True
     },
     RiskLevel.HIGH: {
         "name": "High Risk",
