@@ -737,13 +737,344 @@ class SQLMapTool(CommandTool):
         }
 
 
+class WhatWebTool(CommandTool):
+    """
+    WhatWeb - Web technology fingerprinting tool.
+
+    Identifies technologies used by websites including:
+    - CMS (WordPress, Drupal, Joomla)
+    - Web frameworks
+    - Server software
+    - JavaScript libraries
+    """
+
+    name = "whatweb"
+    description = "Web technology fingerprinting tool to identify CMS, frameworks, and server software"
+    category = ToolCategory.RECON
+    risk_level = "low"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = "whatweb"
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target is a URL or hostname."""
+        return len(target) > 0
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the whatweb command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # Aggression level (1=stealthy, 3=aggressive)
+        aggression = opts.get("aggression", 1)
+        cmd_parts.append(f"-a {aggression}")
+
+        # Output format
+        cmd_parts.append("--log-json=-")
+
+        # User agent
+        if "user_agent" in opts:
+            cmd_parts.append(f"--user-agent=\"{opts['user_agent']}\"")
+
+        cmd_parts.append(target)
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse whatweb JSON output."""
+        import json
+
+        try:
+            data = json.loads(output)
+            if isinstance(data, list) and len(data) > 0:
+                result = data[0]
+                return {
+                    "target": result.get("target", ""),
+                    "technologies": result.get("plugins", {}),
+                    "http_status": result.get("http_status", ""),
+                    "request_config": result.get("request_config", {})
+                }
+        except json.JSONDecodeError:
+            pass
+
+        return {"raw": output}
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "aggression": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4,
+                    "default": 1,
+                    "description": "Aggression level (1=stealthy, 4=heavy)"
+                }
+            }
+        }
+
+
+class FFufTool(CommandTool):
+    """
+    FFuf - Fast web fuzzer written in Go.
+
+    Faster alternative to gobuster for:
+    - Directory/file discovery
+    - Parameter fuzzing
+    - Virtual host discovery
+    """
+
+    name = "ffuf"
+    description = "Fast web fuzzer for directory discovery, parameter fuzzing, and vhost enumeration"
+    category = ToolCategory.ENUMERATION
+    risk_level = "low"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = "ffuf"
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target contains FUZZ keyword or is a valid URL."""
+        return len(target) > 0
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the ffuf command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # URL with FUZZ keyword
+        if "FUZZ" not in target:
+            target = target.rstrip("/") + "/FUZZ"
+        cmd_parts.append(f"-u {target}")
+
+        # Wordlist
+        wordlist = opts.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+        cmd_parts.append(f"-w {wordlist}")
+
+        # Threads
+        threads = opts.get("threads", 40)
+        cmd_parts.append(f"-t {threads}")
+
+        # Filter by status codes
+        if "filter_code" in opts:
+            cmd_parts.append(f"-fc {opts['filter_code']}")
+        else:
+            cmd_parts.append("-fc 404")  # Default: filter 404s
+
+        # Match by status codes
+        if "match_code" in opts:
+            cmd_parts.append(f"-mc {opts['match_code']}")
+
+        # Extensions
+        if "extensions" in opts:
+            cmd_parts.append(f"-e {opts['extensions']}")
+
+        # Output format
+        cmd_parts.append("-o - -of json")
+
+        # Silent mode
+        cmd_parts.append("-s")
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse ffuf JSON output."""
+        import json
+
+        try:
+            data = json.loads(output)
+            results = data.get("results", [])
+            return {
+                "discovered": [
+                    {
+                        "url": r.get("url", ""),
+                        "status": r.get("status", 0),
+                        "length": r.get("length", 0),
+                        "words": r.get("words", 0)
+                    }
+                    for r in results
+                ],
+                "count": len(results),
+                "time": data.get("time", "")
+            }
+        except json.JSONDecodeError:
+            pass
+
+        return {"raw": output}
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "wordlist": {
+                    "type": "string",
+                    "description": "Path to wordlist"
+                },
+                "threads": {
+                    "type": "integer",
+                    "default": 40,
+                    "description": "Number of threads"
+                },
+                "extensions": {
+                    "type": "string",
+                    "description": "File extensions to fuzz (e.g., 'php,html,txt')"
+                },
+                "filter_code": {
+                    "type": "string",
+                    "description": "Filter status codes (e.g., '404,403')"
+                }
+            }
+        }
+
+
+class CurlTool(CommandTool):
+    """
+    Curl - Command line HTTP client.
+
+    Basic web requests for:
+    - Initial connectivity tests
+    - Header inspection
+    - Response analysis
+    """
+
+    name = "curl"
+    description = "HTTP client for web requests, header inspection, and connectivity testing"
+    category = ToolCategory.RECON
+    risk_level = "low"
+    requires_root = False
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        super().__init__(config)
+        self.binary_path = "curl"
+        self.default_timeout = 30
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target is a URL."""
+        return target.startswith("http://") or target.startswith("https://")
+
+    def get_command(
+        self,
+        target: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Build the curl command."""
+        opts = options or {}
+
+        cmd_parts = [self.binary_path]
+
+        # Include headers in output
+        cmd_parts.append("-i")
+
+        # Follow redirects
+        if opts.get("follow_redirects", True):
+            cmd_parts.append("-L")
+
+        # Timeout
+        timeout = opts.get("timeout", 10)
+        cmd_parts.append(f"--connect-timeout {timeout}")
+
+        # Custom headers
+        if "headers" in opts:
+            for header in opts["headers"]:
+                cmd_parts.append(f"-H \"{header}\"")
+
+        # User agent
+        user_agent = opts.get("user_agent", "Mozilla/5.0 (compatible; Cerebrus/1.0)")
+        cmd_parts.append(f"-A \"{user_agent}\"")
+
+        # Silent but show errors
+        cmd_parts.append("-sS")
+
+        cmd_parts.append(f"\"{target}\"")
+
+        return " ".join(cmd_parts)
+
+    def parse_output(self, output: str) -> Dict[str, Any]:
+        """Parse curl output with headers."""
+        result = {
+            "status_code": None,
+            "headers": {},
+            "body_preview": "",
+            "technologies": []
+        }
+
+        lines = output.split("\n")
+        headers_done = False
+        body_lines = []
+
+        for line in lines:
+            if not headers_done:
+                if line.startswith("HTTP/"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        result["status_code"] = int(parts[1])
+                elif ": " in line:
+                    key, value = line.split(": ", 1)
+                    result["headers"][key.lower()] = value.strip()
+
+                    # Detect technologies from headers
+                    if key.lower() == "server":
+                        result["technologies"].append(f"Server: {value.strip()}")
+                    if key.lower() == "x-powered-by":
+                        result["technologies"].append(f"Powered by: {value.strip()}")
+                elif line.strip() == "":
+                    headers_done = True
+            else:
+                body_lines.append(line)
+
+        # Body preview (first 500 chars)
+        body = "\n".join(body_lines)
+        result["body_preview"] = body[:500] if len(body) > 500 else body
+        result["body_length"] = len(body)
+
+        return result
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "follow_redirects": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Follow HTTP redirects"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Connection timeout in seconds"
+                },
+                "headers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Custom headers to send"
+                }
+            }
+        }
+
+
 # Tool registry for easy importing
 KALI_TOOLS = [
     NmapTool,
     NiktoTool,
     GobusterTool,
     HydraTool,
-    SQLMapTool
+    SQLMapTool,
+    WhatWebTool,
+    FFufTool,
+    CurlTool,
 ]
 
 

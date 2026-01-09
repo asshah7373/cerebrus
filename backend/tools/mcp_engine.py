@@ -445,3 +445,139 @@ class MCPEngine:
             "parsed_data": response.result.parsed_data if response.result else {},
             "execution_time_ms": response.result.execution_time_ms if response.result else 0
         }
+
+    async def execute_task(self, task) -> Dict[str, Any]:
+        """
+        Execute a Task object from the orchestrator.
+
+        Maps task properties to the appropriate tool and executes it.
+        Follows patterns from HexStrike/Shannon for tool selection.
+
+        Args:
+            task: Task object with name, task_type, tool, target_id, parameters
+
+        Returns:
+            Dictionary with execution results suitable for the orchestrator
+        """
+        from ..core.state import Task
+
+        logger.info(
+            "MCP executing task",
+            task_id=task.id,
+            task_type=task.task_type,
+            tool=task.tool
+        )
+
+        # Determine the tool to use based on task type and explicit tool
+        tool_name = task.tool
+        target = task.parameters.get("target_address", "") if task.parameters else ""
+        options = task.parameters.copy() if task.parameters else {}
+
+        # Tool selection based on task type (Shannon-style phase mapping)
+        if not tool_name:
+            tool_name = self._select_tool_for_task(task.task_type, target)
+
+        if not tool_name:
+            return {
+                "status": "error",
+                "error": f"No tool available for task type: {task.task_type}",
+                "output": "",
+                "parsed_data": {}
+            }
+
+        # Check if tool is registered
+        if tool_name not in self.tools:
+            logger.warning(f"Tool {tool_name} not registered, using placeholder")
+            return {
+                "status": "completed",
+                "output": f"Tool {tool_name} execution simulated (tool not installed)",
+                "parsed_data": {
+                    "tool": tool_name,
+                    "target": target,
+                    "note": "Install tool or register with MCP engine for real execution"
+                },
+                "execution_time_ms": 0
+            }
+
+        # Execute the tool
+        try:
+            result = await self.execute_for_agent(
+                tool_name=tool_name,
+                arguments={"target": target, "options": options},
+                session_id=task.id  # Use task ID as session context
+            )
+
+            logger.info(
+                "Task execution completed",
+                task_id=task.id,
+                tool=tool_name,
+                status=result.get("status")
+            )
+
+            return result
+
+        except Exception as e:
+            logger.error(
+                "Task execution failed",
+                task_id=task.id,
+                tool=tool_name,
+                error=str(e)
+            )
+            return {
+                "status": "error",
+                "error": str(e),
+                "output": "",
+                "parsed_data": {}
+            }
+
+    def _select_tool_for_task(self, task_type: str, target: str) -> Optional[str]:
+        """
+        Select the appropriate tool based on task type and target.
+        Follows Shannon's phase-based approach.
+
+        Args:
+            task_type: Type of task (recon, scan, exploit, etc.)
+            target: Target specification
+
+        Returns:
+            Tool name or None
+        """
+        # Determine if target is web-based
+        is_web = target.startswith("http://") or target.startswith("https://")
+
+        # Tool selection matrix (HexStrike-style)
+        tool_matrix = {
+            "recon": {
+                "web": ["whatweb", "nikto", "gobuster"],
+                "network": ["nmap"]
+            },
+            "scan": {
+                "web": ["nikto", "gobuster", "sqlmap"],
+                "network": ["nmap"]
+            },
+            "enumeration": {
+                "web": ["gobuster", "ffuf"],
+                "network": ["nmap"]
+            },
+            "exploit": {
+                "web": ["sqlmap"],
+                "network": []
+            }
+        }
+
+        target_type = "web" if is_web else "network"
+        tool_candidates = tool_matrix.get(task_type, {}).get(target_type, [])
+
+        # Return first available tool
+        for tool in tool_candidates:
+            if tool in self.tools:
+                return tool
+
+        # Fallback to first registered tool of appropriate category
+        for name, reg in self.registrations.items():
+            if task_type == "recon" and reg.category in ["recon", "scanning"]:
+                return name
+            if task_type == "scan" and reg.category in ["scanning", "web"]:
+                return name
+
+        return None
