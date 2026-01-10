@@ -1,11 +1,13 @@
 """
 LLM Client for Cerebrus
 Provides AI-powered reasoning for penetration testing decisions.
+Based on PentestGPT's CTF-solving methodology (USENIX Security 2024).
 """
 from typing import Dict, Any, List, Optional
 import structlog
 import json
 import os
+import re
 
 logger = structlog.get_logger()
 
@@ -17,45 +19,239 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
     logger.warning("Anthropic SDK not installed. LLM reasoning will be disabled.")
 
+# Flag detection patterns (from PentestGPT)
+FLAG_PATTERNS = [
+    r'flag\{[^\}]+\}',           # flag{...}
+    r'FLAG\{[^\}]+\}',           # FLAG{...}
+    r'HTB\{[^\}]+\}',            # HTB{...}
+    r'CTF\{[^\}]+\}',            # CTF{...}
+    r'[A-Za-z0-9_]+\{[^\}]+\}',  # Generic CTF format
+    r'[a-f0-9]{32}',             # 32-char hex (HTB standard)
+]
+
 
 class LLMClient:
     """
     LLM client for intelligent decision-making in the pentesting workflow.
     Uses Claude for reasoning about results and generating next steps.
+    Implements PentestGPT-style CTF solving methodology.
     """
 
-    SYSTEM_PROMPT = """You are an expert penetration tester AI assistant. Your role is to:
+    # CTF-focused system prompt based on PentestGPT methodology
+    SYSTEM_PROMPT = """You are an expert AI penetration tester and CTF solver. Your task is to autonomously solve security challenges through systematic exploitation.
 
-1. ANALYZE tool output and identify security findings
-2. DECIDE the next logical step in the assessment
-3. GENERATE specific, actionable tasks based on discoveries
-4. REASON about vulnerabilities and exploitation paths
+## CORE DIRECTIVE
+Your task is INCOMPLETE until you have:
+1. Gained initial access to the target
+2. Captured the user flag (user.txt)
+3. Escalated privileges to root
+4. Captured the root flag (root.txt)
 
-When analyzing results, focus on:
-- Open ports and services (look for vulnerable versions)
-- Web technologies and frameworks (check for known CVEs)
-- Interesting paths and files (admin panels, backups, configs)
-- Authentication mechanisms (bypass opportunities)
-- Input validation flaws (injection points)
+NEVER give up. NEVER say the task is too complex. Re-enumerate when stuck.
 
-For each discovery, think about:
-1. What does this tell us about the target?
-2. What vulnerabilities might exist?
-3. What should we test next?
-4. How can we exploit this?
+## METHODOLOGY (5 Phases)
 
-Respond with structured JSON containing your analysis and recommendations."""
+### Phase 1: RECONNAISSANCE
+- Port scanning (nmap -sC -sV -p-)
+- Service enumeration
+- Technology fingerprinting (whatweb, wappalyzer)
+- Directory discovery (gobuster, ffuf, feroxbuster)
+
+### Phase 2: VULNERABILITY DISCOVERY
+- Version-based CVE lookup for ALL discovered services
+- Web vulnerability scanning (nikto, nuclei)
+- Authentication testing
+- Input validation testing (SQLi, XSS, LFI, RFI, SSTI, SSRF)
+- Source code review if available
+
+### Phase 3: EXPLOITATION
+- Exploit known CVEs (searchsploit, exploit-db, GitHub PoCs)
+- Chain vulnerabilities for access
+- Reverse shell establishment
+- Credential harvesting
+
+### Phase 4: PRIVILEGE ESCALATION
+- Run linpeas.sh/winpeas automatically
+- Check SUID binaries, sudo permissions
+- Kernel exploits (linux-exploit-suggester)
+- Service misconfigurations
+- Credential reuse
+
+### Phase 5: FLAG EXTRACTION
+- Search for flag files (user.txt, root.txt, flag.txt)
+- Extract flags from databases, configs, memory
+- Document proof of exploitation
+
+## ATTACK VECTORS BY CATEGORY
+
+**Web Exploitation:**
+- SQL Injection (UNION, blind, time-based)
+- XSS (reflected, stored, DOM)
+- SSRF, XXE, SSTI, LFI/RFI
+- Authentication bypass, IDOR
+- Deserialization attacks
+
+**Network Exploitation:**
+- SMB: null sessions, EternalBlue
+- SSH: weak credentials, key reuse
+- FTP: anonymous access, known vulns
+- Database: default creds, injection
+
+**Binary/PWN:**
+- Buffer overflows
+- Format string vulnerabilities
+- ROP chains, ret2libc
+
+**Cryptography:**
+- Weak algorithms (MD5, SHA1)
+- Key reuse, padding oracle
+- JWT manipulation
+
+## FLAG FORMATS TO DETECT
+- flag{...}, FLAG{...}
+- HTB{...}, CTF{...}
+- 32-character hex strings
+- Base64 encoded flags
+
+## FALLBACK STRATEGIES
+When initial approach fails:
+1. Re-enumerate with different tools
+2. Try alternative ports/services
+3. Check for hidden directories (.git, .env, backup)
+4. Test default credentials
+5. Look for public exploits on GitHub
+6. Try different shell encodings (base64, URL)
+
+## OUTPUT FORMAT
+Always respond with structured JSON for machine parsing."""
+
+    # Service-specific knowledge base
+    SERVICE_KNOWLEDGE = {
+        "ssh": {
+            "ports": [22, 2222],
+            "tests": ["version_check", "auth_methods", "weak_credentials"],
+            "common_vulns": ["CVE-2018-15473", "user_enumeration"],
+            "tools": ["hydra", "ssh-audit"]
+        },
+        "http": {
+            "ports": [80, 8080, 8000, 8888],
+            "tests": ["tech_detection", "dir_enum", "vuln_scan"],
+            "common_vulns": ["sql_injection", "xss", "lfi", "rce"],
+            "tools": ["nikto", "gobuster", "whatweb", "nuclei"]
+        },
+        "https": {
+            "ports": [443, 8443],
+            "tests": ["ssl_check", "tech_detection", "dir_enum"],
+            "common_vulns": ["ssl_vulns", "web_vulns"],
+            "tools": ["sslscan", "nikto", "gobuster"]
+        },
+        "smb": {
+            "ports": [139, 445],
+            "tests": ["null_session", "shares_enum", "version_check"],
+            "common_vulns": ["ms17-010", "null_session", "printspooler"],
+            "tools": ["smbclient", "enum4linux", "crackmapexec"]
+        },
+        "ftp": {
+            "ports": [21],
+            "tests": ["anonymous_login", "version_check"],
+            "common_vulns": ["anonymous_access", "proftpd_rce"],
+            "tools": ["ftp", "hydra"]
+        },
+        "mysql": {
+            "ports": [3306],
+            "tests": ["default_creds", "version_check"],
+            "common_vulns": ["udf_exploit", "weak_auth"],
+            "tools": ["mysql", "hydra"]
+        },
+        "redis": {
+            "ports": [6379],
+            "tests": ["no_auth", "command_exec"],
+            "common_vulns": ["unauthenticated_access", "rce"],
+            "tools": ["redis-cli"]
+        },
+        "ldap": {
+            "ports": [389, 636],
+            "tests": ["anonymous_bind", "user_enum"],
+            "common_vulns": ["anonymous_access", "injection"],
+            "tools": ["ldapsearch"]
+        }
+    }
 
     def __init__(self, api_key: Optional[str] = None, model: str = "claude-sonnet-4-20250514"):
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self.model = model
         self.client = None
 
+        # Cost tracking (PentestGPT-style)
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost_usd = 0.0
+
+        # Flag tracking
+        self.detected_flags: List[Dict[str, Any]] = []
+
         if ANTHROPIC_AVAILABLE and self.api_key:
             self.client = anthropic.Anthropic(api_key=self.api_key)
             logger.info("LLM client initialized", model=model)
         else:
             logger.warning("LLM client not available - using fallback reasoning")
+
+    def detect_flags(self, text: str) -> List[str]:
+        """
+        Detect CTF flags in text using PentestGPT patterns.
+
+        Args:
+            text: Text to search for flags
+
+        Returns:
+            List of detected flag strings
+        """
+        flags = []
+        for pattern in FLAG_PATTERNS:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if match not in flags:
+                    flags.append(match)
+                    self.detected_flags.append({
+                        "flag": match,
+                        "pattern": pattern,
+                        "context": text[:200] if len(text) > 200 else text
+                    })
+                    logger.info("Flag detected!", flag=match[:20] + "...")
+
+        return flags
+
+    def _calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Calculate API cost based on token usage."""
+        # Claude Sonnet pricing (approximate)
+        input_cost_per_1k = 0.003
+        output_cost_per_1k = 0.015
+
+        cost = (input_tokens / 1000 * input_cost_per_1k) + \
+               (output_tokens / 1000 * output_cost_per_1k)
+
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost_usd += cost
+
+        return cost
+
+    def get_cost_summary(self) -> Dict[str, Any]:
+        """Get cost tracking summary."""
+        return {
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_cost_usd": round(self.total_cost_usd, 4),
+            "flags_detected": len(self.detected_flags)
+        }
+
+    def get_service_tests(self, service_name: str) -> Dict[str, Any]:
+        """Get recommended tests for a service based on knowledge base."""
+        service_lower = service_name.lower()
+        for name, info in self.SERVICE_KNOWLEDGE.items():
+            if name in service_lower or service_lower in name:
+                return info
+        return {}
 
     async def analyze_and_decide(
         self,
@@ -89,16 +285,40 @@ Respond with structured JSON containing your analysis and recommendations."""
                 messages=[{"role": "user", "content": prompt}]
             )
 
+            # Track token usage and cost
+            if hasattr(response, 'usage'):
+                self._calculate_cost(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens
+                )
+
             # Parse the response
             content = response.content[0].text
+
+            # Detect flags in LLM response
+            flags_in_response = self.detect_flags(content)
+            if flags_in_response:
+                logger.info(f"Flags found in LLM response: {len(flags_in_response)}")
+
+            # Also check tool output for flags
+            tool_output = tool_results.get("output", "")
+            flags_in_output = self.detect_flags(tool_output)
+            if flags_in_output:
+                logger.info(f"Flags found in tool output: {len(flags_in_output)}")
 
             # Try to extract JSON from the response
             result = self._parse_llm_response(content)
 
+            # Add detected flags to result
+            result["detected_flags"] = flags_in_response + flags_in_output
+            result["cost_usd"] = self.total_cost_usd
+
             logger.info(
                 "LLM analysis complete",
                 findings_count=len(result.get("findings", [])),
-                next_tasks_count=len(result.get("next_tasks", []))
+                next_tasks_count=len(result.get("next_tasks", [])),
+                flags_detected=len(result.get("detected_flags", [])),
+                cost_usd=round(self.total_cost_usd, 4)
             )
 
             return result
@@ -235,8 +455,31 @@ Respond in this JSON format:
                             "remediation": "Review if this port needs to be exposed"
                         })
 
-                        # Generate follow-up tasks
-                        if service_name in ["http", "https"]:
+                        # Generate follow-up tasks using SERVICE_KNOWLEDGE
+                        service_info = self.get_service_tests(service_name)
+                        if service_info:
+                            for tool in service_info.get("tools", [])[:2]:
+                                next_tasks.append({
+                                    "name": f"{tool} scan on {service_name}:{port_num}",
+                                    "task_type": "scan",
+                                    "tool": tool,
+                                    "risk_level": "medium",
+                                    "parameters": {"target": f"{target}", "port": port_num},
+                                    "reasoning": f"{service_name} service found - running {tool}"
+                                })
+
+                            # Check for common vulnerabilities
+                            for vuln in service_info.get("common_vulns", []):
+                                if "CVE" in vuln:
+                                    next_tasks.append({
+                                        "name": f"Check for {vuln}",
+                                        "task_type": "exploit",
+                                        "tool": "cve_check",
+                                        "risk_level": "high",
+                                        "parameters": {"cve": vuln, "target": target},
+                                        "reasoning": f"Known CVE for {service_name}"
+                                    })
+                        elif service_name in ["http", "https"]:
                             next_tasks.append({
                                 "name": f"Web scan on port {port_num}",
                                 "task_type": "scan",
@@ -245,16 +488,17 @@ Respond in this JSON format:
                                 "parameters": {"target": f"{target}:{port_num}"},
                                 "reasoning": f"HTTP service found on port {port_num}"
                             })
-                        elif "ssh" in service_name.lower():
-                            if version and "7." in version or "8." in version:
-                                findings.append({
-                                    "title": "SSH Version Disclosure",
-                                    "description": f"SSH version {version} is disclosed",
-                                    "severity": "info",
-                                    "category": "Information Disclosure",
-                                    "evidence": f"SSH-{version}",
-                                    "remediation": "Consider hiding SSH version"
-                                })
+
+                        # Version disclosure findings
+                        if version:
+                            findings.append({
+                                "title": f"{service_name.upper()} Version Disclosure",
+                                "description": f"{service_name} version {version} is disclosed",
+                                "severity": "info",
+                                "category": "Information Disclosure",
+                                "evidence": f"{service_name}-{version}",
+                                "remediation": f"Consider hiding {service_name} version banner"
+                            })
 
         # Check for web technologies
         if "technologies" in parsed_data or "plugins" in parsed_data:

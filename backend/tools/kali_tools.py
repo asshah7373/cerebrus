@@ -1065,6 +1065,10 @@ class CurlTool(CommandTool):
         }
 
 
+# Import CVE lookup tools
+from .cve_lookup import CVELookupTool, ExploitSearchTool
+
+
 # Tool registry for easy importing
 KALI_TOOLS = [
     NmapTool,
@@ -1075,6 +1079,8 @@ KALI_TOOLS = [
     WhatWebTool,
     FFufTool,
     CurlTool,
+    CVELookupTool,
+    ExploitSearchTool,
 ]
 
 
