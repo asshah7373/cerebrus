@@ -10,6 +10,7 @@ from datetime import datetime
 import uuid
 
 from .state import PentestState, Task, TaskStatus, Target, AgentState, Finding, SeverityLevel
+from .llm_client import LLMClient
 from ..config import settings, RiskLevel
 
 logger = structlog.get_logger()
@@ -39,6 +40,13 @@ class PentestOrchestrator:
         self.network_agent = None
         self.memory_system = None
         self.execution_engine = None
+        self.ws_manager = None
+
+        # LLM client for intelligent reasoning
+        self.llm_client = LLMClient(
+            api_key=settings.anthropic_api_key,
+            model=settings.default_model
+        )
 
         logger.info("PentestOrchestrator initialized")
 
@@ -543,6 +551,15 @@ class PentestOrchestrator:
             tool=current_task.tool
         )
 
+        # Send activity update - task starting
+        target = state.get_current_target()
+        tool_name = current_task.tool or current_task.task_type
+        await self._send_activity(
+            state.session_id,
+            "execution",
+            f"Executing {tool_name} on {target.address if target else 'target'}..."
+        )
+
         # Execute the task based on type
         result = None
         error = None
@@ -550,7 +567,19 @@ class PentestOrchestrator:
         try:
             if self.execution_engine and hasattr(self.execution_engine, 'execute_task'):
                 # Use the MCP execution engine if available
+                await self._send_activity(
+                    state.session_id,
+                    "command",
+                    f"Running: {tool_name} {current_task.parameters}"
+                )
                 result = await self.execution_engine.execute_task(current_task)
+
+                # Send completion activity
+                await self._send_activity(
+                    state.session_id,
+                    "result",
+                    f"{tool_name} completed: {result.get('status', 'unknown')}"
+                )
             else:
                 # Placeholder execution - simulate task completion
                 # In production, this would call actual security tools
@@ -621,11 +650,10 @@ class PentestOrchestrator:
         }
 
     async def _analyze_results_node(self, state: PentestState) -> Dict[str, Any]:
-        """Analyze execution results and generate findings."""
+        """Analyze execution results using LLM and generate dynamic tasks."""
         current_task = state.get_current_task()
 
         if not current_task:
-            # No current task - nothing to analyze
             return {
                 "workflow_phase": "analysis",
                 "messages": [{
@@ -635,46 +663,128 @@ class PentestOrchestrator:
                 }]
             }
 
-        logger.info("Analyzing results", task_id=current_task.id, has_result=bool(current_task.result))
+        logger.info("Analyzing results with LLM", task_id=current_task.id)
 
-        # Mark task as completed (even if no result, to prevent infinite loops)
-        updated_tasks = []
+        # Send activity update
+        await self._send_activity(
+            state.session_id,
+            "analysis",
+            f"Analyzing results from {current_task.name}..."
+        )
+
+        # Mark task as completed
+        updated_tasks = list(state.tasks)
         completed_tasks = list(state.completed_tasks)
-
         task_status = TaskStatus.COMPLETED if current_task.result else TaskStatus.FAILED
 
-        for task in state.tasks:
+        for task in updated_tasks:
             if task.id == current_task.id:
                 task.status = task_status
                 task.completed_at = datetime.utcnow()
                 completed_tasks.append(task.id)
-            updated_tasks.append(task)
 
-        # Generate findings from tool results
+        # Generate findings from static parsing
         new_findings = []
         if current_task.result and current_task.result.get("status") == "success":
             new_findings = self._generate_findings_from_result(current_task, state)
-            if new_findings:
-                logger.info(
-                    "Generated findings from task",
-                    task_id=current_task.id,
-                    finding_count=len(new_findings)
+
+        # Use LLM for intelligent analysis and dynamic task generation
+        new_tasks = []
+        if current_task.result and self.llm_client:
+            target = state.get_current_target()
+            context = {
+                "target": target.address if target else "",
+                "previous_findings": [f.title for f in state.findings],
+                "completed_tasks": [t.name for t in updated_tasks if t.status == TaskStatus.COMPLETED]
+            }
+
+            try:
+                llm_analysis = await self.llm_client.analyze_and_decide(
+                    context=context,
+                    tool_results={
+                        "tool": current_task.tool or current_task.task_type,
+                        "status": current_task.result.get("status"),
+                        "output": current_task.result.get("output", "")[:5000],
+                        "parsed_data": current_task.result.get("parsed_data", {})
+                    },
+                    current_phase=state.workflow_phase,
+                    objective=state.user_objective
                 )
 
-        # Move to next task in queue
+                # Log LLM reasoning
+                await self._send_activity(
+                    state.session_id,
+                    "reasoning",
+                    llm_analysis.get("analysis", "Analysis complete")
+                )
+
+                # Create findings from LLM analysis
+                for llm_finding in llm_analysis.get("findings", []):
+                    severity_map = {
+                        "critical": SeverityLevel.CRITICAL,
+                        "high": SeverityLevel.HIGH,
+                        "medium": SeverityLevel.MEDIUM,
+                        "low": SeverityLevel.LOW,
+                        "info": SeverityLevel.INFO
+                    }
+                    new_findings.append(Finding(
+                        id=str(uuid.uuid4()),
+                        title=llm_finding.get("title", "Finding"),
+                        description=llm_finding.get("description", ""),
+                        severity=severity_map.get(llm_finding.get("severity", "info"), SeverityLevel.INFO),
+                        category=llm_finding.get("category", "General"),
+                        target=target.address if target else "unknown",
+                        evidence=llm_finding.get("evidence", ""),
+                        remediation=llm_finding.get("remediation", ""),
+                        discovered_at=datetime.utcnow()
+                    ))
+
+                # Create dynamic tasks from LLM recommendations
+                for llm_task in llm_analysis.get("next_tasks", []):
+                    if not self._task_already_exists(llm_task.get("name", ""), updated_tasks):
+                        new_task = Task(
+                            id=str(uuid.uuid4()),
+                            name=llm_task.get("name", "Dynamic Task"),
+                            task_type=llm_task.get("task_type", "scan"),
+                            risk_level=llm_task.get("risk_level", "medium"),
+                            target_id=target.id if target else "",
+                            tool=llm_task.get("tool"),
+                            parameters=llm_task.get("parameters", {}),
+                            requires_approval=llm_task.get("risk_level") in ["high", "critical"]
+                        )
+                        new_tasks.append(new_task)
+
+                        await self._send_activity(
+                            state.session_id,
+                            "task_created",
+                            f"New task: {new_task.name} ({llm_task.get('reasoning', '')})"
+                        )
+
+                logger.info(
+                    "LLM analysis complete",
+                    new_findings=len([f for f in llm_analysis.get("findings", [])]),
+                    new_tasks=len(new_tasks)
+                )
+
+            except Exception as e:
+                logger.error(f"LLM analysis failed: {e}")
+
+        # Update task list and queue
+        updated_tasks.extend(new_tasks)
         task_queue = [t for t in state.task_queue if t != current_task.id]
+        task_queue.extend([t.id for t in new_tasks])
         next_task_id = task_queue[0] if task_queue else None
+
+        # Combine findings
+        all_findings = list(state.findings) + new_findings
 
         logger.info(
             "Task analysis complete",
             task_id=current_task.id,
-            status=task_status.value,
-            remaining_tasks=len(task_queue),
-            new_findings=len(new_findings)
+            new_findings=len(new_findings),
+            new_tasks=len(new_tasks),
+            remaining_tasks=len(task_queue)
         )
-
-        # Combine existing findings with new ones
-        all_findings = list(state.findings) + new_findings
 
         return {
             "tasks": updated_tasks,
@@ -685,10 +795,31 @@ class PentestOrchestrator:
             "workflow_phase": "analysis",
             "messages": [{
                 "role": "system",
-                "content": f"Analysis complete for: {current_task.name} (status: {task_status.value}, findings: {len(new_findings)})",
+                "content": f"Analysis complete: {len(new_findings)} findings, {len(new_tasks)} new tasks",
                 "timestamp": datetime.utcnow().isoformat()
             }]
         }
+
+    def _task_already_exists(self, task_name: str, tasks: List[Task]) -> bool:
+        """Check if a task with similar name already exists."""
+        task_name_lower = task_name.lower()
+        for task in tasks:
+            if task_name_lower in task.name.lower() or task.name.lower() in task_name_lower:
+                return True
+        return False
+
+    async def _send_activity(self, session_id: str, activity_type: str, message: str):
+        """Send activity update to frontend via WebSocket."""
+        if self.ws_manager:
+            try:
+                await self.ws_manager.send_to_session(session_id, {
+                    "type": "activity",
+                    "activity_type": activity_type,
+                    "message": message,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception as e:
+                logger.debug(f"Failed to send activity: {e}")
 
     def _generate_findings_from_result(self, task: Task, state: PentestState) -> List[Finding]:
         """
