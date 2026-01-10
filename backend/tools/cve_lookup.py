@@ -25,6 +25,14 @@ class CVELookupTool(BaseTool):
     risk_level = "low"
     requires_approval = False
 
+    def validate_target(self, target: str) -> bool:
+        """Validate target - accepts any product name."""
+        return bool(target and len(target) > 0)
+
+    def get_command(self, target: str, options: Optional[Dict[str, Any]] = None) -> str:
+        """Return a description of the operation (not a shell command)."""
+        return f"CVE lookup for: {target}"
+
     # Common CVE patterns for quick lookup
     KNOWN_CVES = {
         "xwiki": [
@@ -429,6 +437,14 @@ class ExploitSearchTool(BaseTool):
     category = ToolCategory.EXPLOITATION
     risk_level = "medium"
     requires_approval = True
+
+    def validate_target(self, target: str) -> bool:
+        """Validate target - accepts CVE ID or product name."""
+        return bool(target and len(target) > 0)
+
+    def get_command(self, target: str, options: Optional[Dict[str, Any]] = None) -> str:
+        """Return a description of the operation (not a shell command)."""
+        return f"Exploit search for: {target}"
 
     # Known exploit sources
     EXPLOIT_DB = {
