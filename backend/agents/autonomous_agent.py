@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 import asyncio
+import subprocess
 import re
 import json
 import structlog
@@ -105,24 +106,51 @@ class AgentState:
     error: Optional[str] = None
 
 
+def normalize_target(target: str) -> Tuple[str, str, int]:
+    """
+    Normalize target to standard format.
+    Returns (normalized_url, host, port)
+    """
+    # Remove any protocol prefix for parsing
+    clean = target.replace("http://", "").replace("https://", "")
+
+    # Parse host and port
+    if ":" in clean:
+        host, port_str = clean.rsplit(":", 1)
+        try:
+            port = int(port_str.split("/")[0])  # Handle paths after port
+        except ValueError:
+            port = 80
+    else:
+        host = clean.split("/")[0]
+        port = 80
+
+    # Determine if HTTPS based on port
+    if port == 443:
+        url = f"https://{host}:{port}"
+    else:
+        url = f"http://{host}:{port}"
+
+    return url, host, port
+
+
 class DataExtractor:
     """
     Intelligent data extraction from tool outputs.
-
-    Extracts credentials, endpoints, versions, and other valuable
-    information using pattern matching and LLM analysis.
     """
 
     # Regex patterns for common data types
     PATTERNS = {
         ExtractionType.CREDENTIAL: [
-            r'(?i)password[:\s=]+[\'"]?([^\s\'"]+)',
-            r'(?i)passwd[:\s=]+[\'"]?([^\s\'"]+)',
-            r'(?i)pwd[:\s=]+[\'"]?([^\s\'"]+)',
-            r'(?i)secret[:\s=]+[\'"]?([^\s\'"]+)',
-            r'(?i)api[_-]?key[:\s=]+[\'"]?([^\s\'"]+)',
-            r'(?i)token[:\s=]+[\'"]?([^\s\'"]+)',
-            r'(?i)auth[:\s=]+[\'"]?([^\s\'"]+)',
+            r'(?i)password[:\s=]+[\'"]?([^\s\'"<>]{3,50})[\'"]?',
+            r'(?i)passwd[:\s=]+[\'"]?([^\s\'"<>]{3,50})[\'"]?',
+            r'(?i)pwd[:\s=]+[\'"]?([^\s\'"<>]{3,50})[\'"]?',
+            r'(?i)username[:\s=]+[\'"]?([^\s\'"<>]{3,50})[\'"]?',
+            r'(?i)user[:\s=]+[\'"]?([^\s\'"<>]{3,50})[\'"]?',
+            r'(?i)login[:\s=]+[\'"]?([^\s\'"<>]{3,50})[\'"]?',
+            r'(?i)api[_-]?key[:\s=]+[\'"]?([^\s\'"<>]{10,100})[\'"]?',
+            r'(?i)secret[:\s=]+[\'"]?([^\s\'"<>]{3,100})[\'"]?',
+            r'(?i)token[:\s=]+[\'"]?([^\s\'"<>]{10,200})[\'"]?',
             r'login:\s*(\S+)\s+password:\s*(\S+)',
         ],
         ExtractionType.HASH: [
@@ -133,22 +161,34 @@ class DataExtractor:
             r'\$2[aby]?\$\d+\$[./A-Za-z0-9]+',  # bcrypt
         ],
         ExtractionType.VERSION: [
-            r'(?i)version[:\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'(?i)v([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'([a-zA-Z]+)[/\s]([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'(?i)apache[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'(?i)nginx[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'(?i)php[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'(?i)mysql[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
-            r'(?i)openssh[_\s]+([0-9]+\.[0-9]+(?:p[0-9]+)?)',
+            r'(?i)(apache)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(nginx)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(php)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(mysql|mariadb)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(openssh)[_\s]+([0-9]+\.[0-9]+(?:p[0-9]+)?)',
+            r'(?i)(wordpress)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(drupal)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(joomla)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(tomcat)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(python)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
+            r'(?i)(node|nodejs)[/\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)',
         ],
         ExtractionType.ENDPOINT: [
-            r'(?i)(https?://[^\s<>"\']+)',
-            r'(?i)(/[a-zA-Z0-9_\-./]+\.(?:php|asp|aspx|jsp|html|js|json|xml|txt|cfg|conf|bak|old|sql))',
+            r'(?:href|src|action)=["\']([^"\']+)["\']',
+            r'(?i)(/[a-zA-Z0-9_\-./]+\.(?:php|asp|aspx|jsp|html|js|json|xml|txt|cfg|conf|bak|old|sql|zip|tar|gz))',
             r'(?i)(/api/[^\s<>"\']+)',
             r'(?i)(/admin[^\s<>"\']*)',
             r'(?i)(/login[^\s<>"\']*)',
             r'(?i)(/upload[^\s<>"\']*)',
+            r'(?i)(/backup[^\s<>"\']*)',
+            r'(?i)(/config[^\s<>"\']*)',
+            r'(?i)(/\.git[^\s<>"\']*)',
+            r'(?i)(/\.env[^\s<>"\']*)',
+            r'(?i)(/robots\.txt)',
+            r'(?i)(/sitemap\.xml)',
+            r'(?i)(/wp-admin[^\s<>"\']*)',
+            r'(?i)(/wp-content[^\s<>"\']*)',
+            r'(?i)(/phpmyadmin[^\s<>"\']*)',
         ],
         ExtractionType.EMAIL: [
             r'\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b',
@@ -157,33 +197,26 @@ class DataExtractor:
             r'(\d+)/tcp\s+open\s+(\S+)',
             r'(\d+)/udp\s+open\s+(\S+)',
         ],
-        ExtractionType.HOSTNAME: [
-            r'(?i)hostname[:\s]+([a-zA-Z0-9\-\.]+)',
-            r'(?i)server[:\s]+([a-zA-Z0-9\-\.]+)',
-            r'(?i)domain[:\s]+([a-zA-Z0-9\-\.]+)',
-        ],
         ExtractionType.FLAG: [
             r'(?i)flag\{([^}]+)\}',
             r'(?i)ctf\{([^}]+)\}',
             r'(?i)htb\{([^}]+)\}',
             r'(?i)thm\{([^}]+)\}',
+            r'(?i)picoCTF\{([^}]+)\}',
             r'(?i)user\.txt[:\s]*([a-fA-F0-9]{32})',
             r'(?i)root\.txt[:\s]*([a-fA-F0-9]{32})',
-            r'[a-fA-F0-9]{32}',  # Generic hash-like flag
         ],
         ExtractionType.PATH: [
             r'(?i)(/(?:home|var|etc|opt|usr|tmp|root)/[^\s<>"\']+)',
             r'(?i)(C:\\[^\s<>"\']+)',
-            r'(?i)(/\.(?:git|svn|env|htaccess|htpasswd)[^\s<>"\']*)',
         ],
         ExtractionType.PARAMETER: [
             r'\?([a-zA-Z0-9_]+)=',
             r'&([a-zA-Z0-9_]+)=',
-            r'(?i)parameter[:\s]+([a-zA-Z0-9_]+)',
+            r'name=["\']([a-zA-Z0-9_]+)["\']',
         ],
         ExtractionType.TOKEN: [
             r'(?i)bearer\s+([a-zA-Z0-9\-._~+/]+=*)',
-            r'(?i)jwt[:\s]+([a-zA-Z0-9\-._~+/]+=*)',
             r'eyJ[a-zA-Z0-9\-_]+\.eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+',  # JWT
         ],
     }
@@ -198,27 +231,36 @@ class DataExtractor:
             r'(?i)warning.*mysql',
             r'(?i)unclosed quotation mark',
             r'(?i)SQLSTATE',
+            r'(?i)you have an error in your sql',
         ],
         "xss": [
             r'<script[^>]*>',
             r'javascript:',
             r'on\w+\s*=',
+            r'(?i)alert\s*\(',
         ],
         "lfi": [
             r'root:x:0:0',
             r'\[boot loader\]',
-            r'<?php',
+            r'include\s*\(',
+            r'file_get_contents',
         ],
         "rce": [
             r'uid=\d+.*gid=\d+',
             r'Linux.*GNU',
             r'Windows.*Microsoft',
+            r'(?i)command\s+not\s+found',
         ],
-        "ssrf": [
-            r'(?i)internal\s+server',
-            r'localhost',
-            r'127\.0\.0\.1',
-            r'169\.254\.',
+        "directory_listing": [
+            r'Index of /',
+            r'Directory listing for',
+            r'Parent Directory',
+        ],
+        "information_disclosure": [
+            r'(?i)phpinfo\(\)',
+            r'(?i)debug\s*=\s*true',
+            r'(?i)stack\s*trace',
+            r'(?i)exception\s+in\s+thread',
         ],
     }
 
@@ -231,17 +273,7 @@ class DataExtractor:
         tool_name: str,
         target: str
     ) -> List[ExtractedData]:
-        """
-        Extract all valuable data from tool output.
-
-        Args:
-            output: Raw tool output
-            tool_name: Name of the tool that produced output
-            target: Target that was scanned
-
-        Returns:
-            List of extracted data items
-        """
+        """Extract all valuable data from tool output."""
         extracted = []
 
         # Pattern-based extraction
@@ -250,10 +282,17 @@ class DataExtractor:
                 try:
                     matches = re.findall(pattern, output, re.MULTILINE | re.IGNORECASE)
                     for match in matches:
-                        value = match if isinstance(match, str) else match[0]
+                        if isinstance(match, tuple):
+                            # For version patterns that capture software name + version
+                            if data_type == ExtractionType.VERSION and len(match) == 2:
+                                value = f"{match[0]} {match[1]}"
+                            else:
+                                value = match[0]
+                        else:
+                            value = match
+
                         if self._is_valid_extraction(data_type, value):
-                            # Get surrounding context
-                            context = self._get_context(output, value)
+                            context = self._get_context(output, value if isinstance(value, str) else str(value))
                             extracted.append(ExtractedData(
                                 type=data_type,
                                 value=value,
@@ -282,97 +321,79 @@ class DataExtractor:
             "Data extraction complete",
             tool=tool_name,
             extracted_count=len(unique),
-            types=[e.type.value for e in unique]
+            types=list(set(e.type.value for e in unique))
         )
 
         return unique
 
     def _is_valid_extraction(self, data_type: ExtractionType, value: str) -> bool:
         """Validate extracted data."""
-        if not value or len(value) < 2:
+        if not value or len(str(value)) < 2:
             return False
 
-        # Type-specific validation
-        if data_type == ExtractionType.EMAIL:
-            return '@' in value and '.' in value
-        elif data_type == ExtractionType.HASH:
-            return len(value) in [32, 40, 64] or value.startswith('$')
-        elif data_type == ExtractionType.VERSION:
-            return any(c.isdigit() for c in value)
+        value_str = str(value).lower()
+
+        # Filter common false positives
+        false_positives = ['password', 'secret', 'token', 'key', 'none', 'null',
+                         'undefined', 'true', 'false', 'example', 'test', 'demo',
+                         'your_', 'change_me', 'xxx', 'placeholder']
+
+        if data_type == ExtractionType.CREDENTIAL:
+            if any(fp in value_str for fp in false_positives):
+                return False
+            if len(value) < 3:
+                return False
         elif data_type == ExtractionType.ENDPOINT:
-            return value.startswith('/') or value.startswith('http')
-        elif data_type == ExtractionType.CREDENTIAL:
-            # Filter out common false positives
-            false_positives = ['password', 'secret', 'token', 'key', 'none', 'null', 'undefined']
-            return value.lower() not in false_positives
+            if not value.startswith('/'):
+                return False
+            if value in ['/', '//', '/#']:
+                return False
+        elif data_type == ExtractionType.FLAG:
+            if len(value) < 5:
+                return False
 
         return True
 
     def _get_context(self, output: str, value: str, context_chars: int = 100) -> str:
         """Get surrounding context for extracted value."""
         try:
-            idx = output.find(value)
+            idx = output.find(str(value))
             if idx == -1:
                 return ""
             start = max(0, idx - context_chars)
-            end = min(len(output), idx + len(value) + context_chars)
+            end = min(len(output), idx + len(str(value)) + context_chars)
             return output[start:end].replace('\n', ' ').strip()
         except:
             return ""
 
-    def _calculate_confidence(
-        self,
-        data_type: ExtractionType,
-        value: str,
-        context: str
-    ) -> float:
+    def _calculate_confidence(self, data_type: ExtractionType, value: str, context: str) -> float:
         """Calculate confidence score for extraction."""
-        confidence = 0.5  # Base confidence
-
-        # Increase confidence based on context clues
+        confidence = 0.5
         context_lower = context.lower()
 
-        if data_type == ExtractionType.CREDENTIAL:
+        if data_type == ExtractionType.FLAG:
+            confidence = 0.95  # Flags are high confidence
+        elif data_type == ExtractionType.CREDENTIAL:
             if 'password' in context_lower or 'passwd' in context_lower:
                 confidence += 0.2
-            if 'login' in context_lower or 'auth' in context_lower:
-                confidence += 0.1
-            if 'success' in context_lower:
+            if 'success' in context_lower or 'valid' in context_lower:
                 confidence += 0.2
-
         elif data_type == ExtractionType.VERSION:
-            if 'server' in context_lower or 'apache' in context_lower:
-                confidence += 0.2
-            if 'running' in context_lower:
-                confidence += 0.1
-
-        elif data_type == ExtractionType.FLAG:
-            if 'flag' in context_lower or 'ctf' in context_lower:
-                confidence += 0.3
-            if 'user.txt' in context_lower or 'root.txt' in context_lower:
-                confidence += 0.4
-
+            confidence = 0.8  # Versions are usually accurate
         elif data_type == ExtractionType.VULNERABILITY:
-            if 'vulnerable' in context_lower or 'exploitable' in context_lower:
-                confidence += 0.3
-            if 'critical' in context_lower or 'high' in context_lower:
-                confidence += 0.2
+            confidence = 0.7
 
         return min(confidence, 1.0)
 
-    def _extract_vulnerabilities(
-        self,
-        output: str,
-        tool_name: str,
-        target: str
-    ) -> List[ExtractedData]:
+    def _extract_vulnerabilities(self, output: str, tool_name: str, target: str) -> List[ExtractedData]:
         """Extract vulnerability indicators from output."""
         extracted = []
 
         for vuln_type, patterns in self.VULN_INDICATORS.items():
             for pattern in patterns:
-                if re.search(pattern, output, re.IGNORECASE):
-                    context = self._get_context(output, re.search(pattern, output, re.IGNORECASE).group())
+                match = re.search(pattern, output, re.IGNORECASE)
+                if match:
+                    context = self._get_context(output, match.group())
                     extracted.append(ExtractedData(
                         type=ExtractionType.VULNERABILITY,
                         value=vuln_type,
@@ -382,7 +403,7 @@ class DataExtractor:
                         metadata={
                             "target": target,
                             "vuln_type": vuln_type,
-                            "indicator_pattern": pattern
+                            "match": match.group()
                         }
                     ))
                     break  # One per vuln type
@@ -396,16 +417,12 @@ class DataExtractor:
         target: str,
         objective: str
     ) -> List[ExtractedData]:
-        """
-        Use LLM to extract and analyze data from tool output.
-
-        This provides deeper analysis beyond pattern matching.
-        """
-        if not self.llm_client:
-            return []
-
+        """Use LLM to extract and analyze data from tool output."""
         # First do pattern extraction
         pattern_extracted = self.extract_all(output, tool_name, target)
+
+        if not self.llm_client:
+            return pattern_extracted
 
         # Then use LLM for deeper analysis
         prompt = f"""Analyze this {tool_name} output and extract valuable pentesting information.
@@ -415,36 +432,27 @@ Objective: {objective}
 
 Tool Output:
 ```
-{output[:4000]}  # Truncate for token limits
+{output[:4000]}
 ```
 
-Already extracted by patterns:
-{json.dumps([{"type": e.type.value, "value": e.value} for e in pattern_extracted[:20]], indent=2)}
+Already extracted:
+{json.dumps([{"type": e.type.value, "value": e.value} for e in pattern_extracted[:15]], indent=2)}
 
-Extract any ADDITIONAL information not already found:
+Find ADDITIONAL information:
 1. Credentials (usernames, passwords, API keys)
-2. Interesting endpoints or paths
-3. Version numbers and software
-4. Potential vulnerabilities
-5. Configuration issues
-6. Flags or objectives
+2. Interesting endpoints or hidden paths
+3. Version numbers with software names
+4. Vulnerabilities (SQLi, XSS, LFI, RCE indicators)
+5. Flags (flag{{}}, CTF{{}}, etc.)
 
-Return JSON:
-{{
-    "additional_findings": [
-        {{"type": "credential|endpoint|version|vulnerability|service|flag", "value": "...", "confidence": 0.0-1.0, "reasoning": "..."}}
-    ],
-    "attack_surface_summary": "brief summary of attack surface discovered",
-    "recommended_next_steps": ["step1", "step2"]
-}}"""
+Return JSON only:
+{{"additional_findings": [{{"type": "credential|endpoint|version|vulnerability|flag", "value": "...", "confidence": 0.0-1.0, "reasoning": "..."}}], "recommended_next_steps": ["step1", "step2"]}}"""
 
         try:
             response = await self.llm_client._call_llm(prompt)
-            # Parse JSON from response
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
                 data = json.loads(json_match.group())
-
                 for finding in data.get("additional_findings", []):
                     try:
                         extraction_type = ExtractionType(finding["type"])
@@ -453,16 +461,11 @@ Return JSON:
                             value=finding["value"],
                             context=finding.get("reasoning", ""),
                             confidence=finding.get("confidence", 0.6),
-                            source_tool=f"{tool_name}_llm_analysis",
-                            metadata={
-                                "target": target,
-                                "llm_analyzed": True,
-                                "reasoning": finding.get("reasoning", "")
-                            }
+                            source_tool=f"{tool_name}_llm",
+                            metadata={"llm_analyzed": True}
                         ))
                     except (ValueError, KeyError):
                         continue
-
         except Exception as e:
             logger.warning(f"LLM extraction failed: {e}")
 
@@ -470,30 +473,8 @@ Return JSON:
 
 
 class DecisionEngine:
-    """
-    LLM-driven decision engine for selecting next actions.
+    """LLM-driven decision engine for selecting next actions."""
 
-    Analyzes current state, extracted data, and objectives
-    to dynamically determine optimal next steps.
-    """
-
-    # Tool selection based on findings
-    TOOL_MAPPINGS = {
-        "service_http": ["nikto", "gobuster", "ffuf", "whatweb", "curl"],
-        "service_ssh": ["hydra", "nmap"],
-        "service_ftp": ["hydra", "nmap"],
-        "service_smb": ["nmap", "enum4linux"],
-        "service_mysql": ["hydra", "nmap", "sqlmap"],
-        "service_unknown": ["nmap"],
-        "credential_found": ["hydra", "ssh", "ftp"],
-        "endpoint_found": ["curl", "ffuf", "sqlmap", "nikto"],
-        "version_outdated": ["searchsploit", "msfconsole_search", "cve_lookup"],
-        "vulnerability_sqli": ["sqlmap"],
-        "vulnerability_lfi": ["curl", "ffuf"],
-        "vulnerability_rce": ["revshell_generator", "nc_listener"],
-    }
-
-    # Phase progression
     PHASES = ["reconnaissance", "enumeration", "vulnerability_analysis", "exploitation", "post_exploitation"]
 
     def __init__(self, llm_client: LLMClient):
@@ -504,17 +485,96 @@ class DecisionEngine:
         state: AgentState,
         last_result: Optional[Dict] = None
     ) -> List[PentestAction]:
-        """
-        Decide next actions based on current state.
+        """Decide next actions based on current state."""
 
-        Uses LLM reasoning to determine optimal next steps
-        considering all discovered data and objectives.
-        """
-        # Build context for decision
-        context = self._build_decision_context(state, last_result)
+        # For first iteration, use smart defaults
+        if state.iteration == 0:
+            return self._get_initial_actions(state)
 
-        # Use LLM to reason about next steps
-        prompt = f"""You are an expert penetration tester. Analyze the current state and decide the next actions.
+        # Use LLM for subsequent decisions
+        prompt = self._build_decision_prompt(state, last_result)
+
+        try:
+            response = await self.llm_client._call_llm(prompt)
+            json_match = re.search(r'\[[\s\S]*\]', response)
+            if json_match:
+                actions_data = json.loads(json_match.group())
+                actions = []
+                for action in actions_data:
+                    target = action.get("target", state.targets[0] if state.targets else "")
+                    # Ensure web targets have http prefix
+                    if action.get("tool") in ["curl", "nikto", "gobuster", "ffuf", "whatweb", "sqlmap"]:
+                        if not target.startswith("http"):
+                            target = f"http://{target}"
+
+                    actions.append(PentestAction(
+                        tool=action.get("tool", "nmap"),
+                        target=target,
+                        options=action.get("options", {}),
+                        reasoning=action.get("reasoning", ""),
+                        priority=action.get("priority", 5),
+                        expected_outcome=action.get("expected_outcome", "")
+                    ))
+
+                actions.sort(key=lambda a: a.priority, reverse=True)
+                logger.info(f"LLM decided actions: {[a.tool for a in actions]}")
+                return actions[:3]
+
+        except Exception as e:
+            logger.warning(f"LLM decision failed: {e}, using fallback")
+
+        return self._fallback_decisions(state)
+
+    def _get_initial_actions(self, state: AgentState) -> List[PentestAction]:
+        """Get smart initial actions based on targets."""
+        actions = []
+
+        for target in state.targets:
+            url, host, port = normalize_target(target)
+
+            # Check if it's a web service (common web ports or has http in target)
+            is_web = port in [80, 443, 8080, 8443, 3000, 5000, 8000, 9000] or "http" in target.lower()
+
+            if is_web:
+                # Web target - start with web reconnaissance
+                actions.extend([
+                    PentestAction(
+                        tool="curl",
+                        target=url,
+                        options={"follow_redirects": True},
+                        reasoning=f"Initial HTTP request to see response headers and content",
+                        priority=10
+                    ),
+                    PentestAction(
+                        tool="whatweb",
+                        target=url,
+                        options={"aggression": 3},
+                        reasoning="Fingerprint web technologies (CMS, frameworks, server)",
+                        priority=9
+                    ),
+                    PentestAction(
+                        tool="gobuster",
+                        target=url,
+                        options={"mode": "dir", "extensions": "php,html,txt,bak"},
+                        reasoning="Enumerate directories and files",
+                        priority=8
+                    ),
+                ])
+            else:
+                # Network target - start with port scan
+                actions.append(PentestAction(
+                    tool="nmap",
+                    target=host,
+                    options={"scan_type": "comprehensive", "ports": str(port) if port != 80 else "1-1000"},
+                    reasoning="Comprehensive port scan to discover services",
+                    priority=10
+                ))
+
+        return actions[:5]  # Limit to 5 initial actions
+
+    def _build_decision_prompt(self, state: AgentState, last_result: Optional[Dict]) -> str:
+        """Build the decision prompt for LLM."""
+        return f"""You are an expert penetration tester. Decide the next actions.
 
 ## Current State
 Phase: {state.phase}
@@ -522,151 +582,79 @@ Iteration: {state.iteration}/{state.max_iterations}
 Objective: {state.objective}
 Targets: {', '.join(state.targets)}
 
-## Discovered Information
-Services: {json.dumps(state.services, indent=2)[:1500]}
-Credentials: {json.dumps(state.credentials, indent=2)[:500]}
-Endpoints: {json.dumps(state.endpoints[:20], indent=2)}
-Vulnerabilities: {json.dumps(state.vulnerabilities[:10], indent=2)}
+## Discovered Services
+{json.dumps(state.services, indent=2)[:1000]}
 
-## Recent Extractions
-{json.dumps([{{"type": e.type.value, "value": e.value[:50], "confidence": e.confidence}} for e in state.extracted_data[-20:]], indent=2)}
+## Found Credentials
+{json.dumps(state.credentials[:10], indent=2)}
 
-## Execution History (Last 5)
-{json.dumps(state.executed_actions[-5:], indent=2)[:1000]}
+## Discovered Endpoints
+{json.dumps(state.endpoints[:20], indent=2)}
+
+## Vulnerabilities
+{json.dumps(state.vulnerabilities[:10], indent=2)}
 
 ## Last Tool Result
-{json.dumps(last_result, indent=2)[:1500] if last_result else "None"}
+Tool: {last_result.get('tool') if last_result else 'None'}
+Success: {last_result.get('success') if last_result else 'N/A'}
+Output Preview: {last_result.get('output', '')[:1000] if last_result else 'None'}
+
+## Actions Already Executed
+{[a.get('tool') + ' -> ' + a.get('target', '')[:30] for a in state.executed_actions[-10:]]}
 
 ## Available Tools
-- nmap: Network scanning, service detection
-- nikto: Web vulnerability scanning
-- gobuster/ffuf: Directory enumeration
-- sqlmap: SQL injection testing
-- hydra: Credential brute-forcing
-- searchsploit: Exploit search
-- curl: HTTP requests
-- whatweb: Technology fingerprinting
-- cve_lookup: CVE search
-- linpeas/linenum: Privilege escalation enumeration
-- revshell_generator: Generate reverse shells
+- nmap: Port scanning, service detection (target: IP or hostname)
+- curl: HTTP requests (target: URL with http://)
+- whatweb: Web fingerprinting (target: URL)
+- nikto: Web vulnerability scan (target: URL)
+- gobuster: Directory brute-force (target: URL)
+- ffuf: Fast fuzzing (target: URL with FUZZ)
+- sqlmap: SQL injection (target: URL with parameter)
+- hydra: Brute-force login (target: service://host)
+- searchsploit: Search exploits (target: software name)
+- cve_lookup: Search CVEs (target: software/version)
 
 ## Instructions
-Based on the current state, determine the 1-3 most valuable next actions.
-Consider:
-1. What information gaps exist?
-2. What leads should be followed up?
-3. What vulnerabilities can be exploited?
-4. What's the most efficient path to the objective?
+Based on discoveries, decide 1-3 next actions. Be specific!
+- If you found versions, search for exploits
+- If you found login pages, try common creds or SQLi
+- If you found directories, explore them
+- If you found vulnerabilities, exploit them
 
-Return JSON array of actions:
-[
-    {{
-        "tool": "tool_name",
-        "target": "target_url_or_ip",
-        "options": {{}},
-        "reasoning": "why this action",
-        "priority": 1-10,
-        "expected_outcome": "what we expect to find"
-    }}
-]
-
-IMPORTANT:
-- Be specific with targets (include ports, paths)
-- Chain actions logically (don't skip steps)
-- Prioritize based on objective
-- If credentials found, try them
-- If version found, search for exploits
-- Progress through phases naturally"""
-
-        try:
-            response = await self.llm_client._call_llm(prompt)
-
-            # Parse JSON array from response
-            json_match = re.search(r'\[[\s\S]*\]', response)
-            if json_match:
-                actions_data = json.loads(json_match.group())
-
-                actions = []
-                for action in actions_data:
-                    actions.append(PentestAction(
-                        tool=action.get("tool", "nmap"),
-                        target=action.get("target", state.targets[0] if state.targets else ""),
-                        options=action.get("options", {}),
-                        reasoning=action.get("reasoning", ""),
-                        priority=action.get("priority", 5),
-                        expected_outcome=action.get("expected_outcome", "")
-                    ))
-
-                # Sort by priority
-                actions.sort(key=lambda a: a.priority, reverse=True)
-
-                logger.info(
-                    "Decision engine selected actions",
-                    count=len(actions),
-                    tools=[a.tool for a in actions]
-                )
-
-                return actions
-
-        except Exception as e:
-            logger.error(f"Decision engine failed: {e}")
-
-        # Fallback to rule-based decisions
-        return self._fallback_decisions(state)
-
-    def _build_decision_context(
-        self,
-        state: AgentState,
-        last_result: Optional[Dict]
-    ) -> Dict:
-        """Build context dictionary for decision making."""
-        return {
-            "phase": state.phase,
-            "targets": state.targets,
-            "services": state.services,
-            "credentials": state.credentials,
-            "vulnerabilities": state.vulnerabilities,
-            "last_result": last_result,
-            "iteration": state.iteration
-        }
+Return JSON array ONLY:
+[{{"tool": "...", "target": "full_target_url_or_ip", "options": {{}}, "reasoning": "why", "priority": 1-10}}]"""
 
     def _fallback_decisions(self, state: AgentState) -> List[PentestAction]:
-        """
-        Rule-based fallback when LLM is unavailable.
-
-        Uses discovered data to make logical next steps.
-        """
+        """Rule-based fallback when LLM unavailable."""
         actions = []
 
         if state.phase == "reconnaissance":
-            # Start with nmap scan
             for target in state.targets:
-                if not any(target in str(a) for a in state.executed_actions):
+                url, host, port = normalize_target(target)
+                if not any(host in str(a) for a in state.executed_actions):
                     actions.append(PentestAction(
                         tool="nmap",
-                        target=target,
-                        options={"scan_type": "comprehensive", "top_ports": 1000},
-                        reasoning="Initial comprehensive scan",
+                        target=host,
+                        options={"scan_type": "comprehensive"},
+                        reasoning="Port scan",
                         priority=10
                     ))
 
         elif state.phase == "enumeration":
-            # Enumerate discovered services
             for host, services in state.services.items():
                 for svc in services:
                     if svc.get("name") in ["http", "https"]:
                         port = svc.get("port", 80)
-                        target = f"http://{host}:{port}"
+                        url = f"http://{host}:{port}"
                         actions.append(PentestAction(
                             tool="gobuster",
-                            target=target,
+                            target=url,
                             options={"mode": "dir"},
-                            reasoning=f"Directory enumeration on {target}",
+                            reasoning=f"Directory enumeration",
                             priority=8
                         ))
 
         elif state.phase == "vulnerability_analysis":
-            # Search for exploits based on versions
             for data in state.extracted_data:
                 if data.type == ExtractionType.VERSION:
                     actions.append(PentestAction(
@@ -677,33 +665,14 @@ IMPORTANT:
                         priority=7
                     ))
 
-        elif state.phase == "exploitation":
-            # Attempt exploitation based on vulnerabilities
-            for vuln in state.vulnerabilities:
-                if vuln.get("type") == "sql_injection":
-                    actions.append(PentestAction(
-                        tool="sqlmap",
-                        target=vuln.get("target", state.targets[0]),
-                        options={"level": 2, "risk": 2},
-                        reasoning="Exploit SQL injection",
-                        priority=9
-                    ))
-
-        return actions[:3]  # Return top 3
+        return actions[:3]
 
     def determine_phase(self, state: AgentState) -> str:
-        """
-        Determine current pentest phase based on state.
-
-        Automatically progresses through phases as information is gathered.
-        """
-        # Check phase progression criteria
-        if not state.services:
+        """Determine current pentest phase based on state."""
+        if not state.services and state.iteration < 5:
             return "reconnaissance"
 
-        total_services = sum(len(svcs) for svcs in state.services.values())
-
-        if total_services > 0 and len(state.endpoints) < 5:
+        if state.services and len(state.endpoints) < 10:
             return "enumeration"
 
         if state.endpoints and not state.vulnerabilities:
@@ -719,204 +688,53 @@ IMPORTANT:
 
 
 class ExploitChainer:
-    """
-    Automatic exploit chaining.
-
-    Identifies and executes multi-step attack chains
-    based on discovered vulnerabilities and access levels.
-    """
-
-    # Common exploit chains
-    CHAIN_TEMPLATES = {
-        "web_to_shell": {
-            "entry": ["sql_injection", "lfi", "rce", "file_upload"],
-            "steps": [
-                {"condition": "sql_injection", "action": "sqlmap_dump"},
-                {"condition": "lfi", "action": "lfi_to_rce"},
-                {"condition": "file_upload", "action": "upload_shell"},
-                {"condition": "rce", "action": "reverse_shell"},
-            ],
-            "outcome": "shell_access"
-        },
-        "cred_to_access": {
-            "entry": ["credential"],
-            "steps": [
-                {"condition": "ssh_available", "action": "ssh_login"},
-                {"condition": "ftp_available", "action": "ftp_login"},
-                {"condition": "smb_available", "action": "smb_login"},
-            ],
-            "outcome": "authenticated_access"
-        },
-        "privesc_linux": {
-            "entry": ["shell_access"],
-            "steps": [
-                {"condition": "shell", "action": "linpeas"},
-                {"condition": "suid_found", "action": "gtfobins"},
-                {"condition": "sudo_nopasswd", "action": "sudo_exploit"},
-                {"condition": "kernel_vuln", "action": "kernel_exploit"},
-            ],
-            "outcome": "root_access"
-        },
-    }
+    """Automatic exploit chaining."""
 
     def __init__(self, llm_client: LLMClient, mcp_engine: MCPEngine):
         self.llm_client = llm_client
         self.mcp_engine = mcp_engine
 
-    async def identify_chains(
-        self,
-        state: AgentState
-    ) -> List[ExploitChain]:
-        """
-        Identify possible exploit chains based on current state.
-        """
+    async def identify_chains(self, state: AgentState) -> List[ExploitChain]:
+        """Identify possible exploit chains."""
         chains = []
 
-        # Check each template
-        for chain_name, template in self.CHAIN_TEMPLATES.items():
-            # Check if entry conditions are met
-            entry_met = False
-            entry_point = None
+        # SQL injection to data dump
+        sqli_vulns = [v for v in state.vulnerabilities if "sql" in v.get("type", "").lower()]
+        if sqli_vulns:
+            chains.append(ExploitChain(
+                name="sqli_dump",
+                steps=[PentestAction(
+                    tool="sqlmap",
+                    target=sqli_vulns[0].get("target", state.targets[0]),
+                    options={"dbs": True, "dump": True},
+                    reasoning="Dump database via SQL injection",
+                    priority=9
+                )],
+                target=sqli_vulns[0].get("target", ""),
+                entry_point="sql_injection",
+                expected_access="database",
+                confidence=0.8
+            ))
 
-            for entry in template["entry"]:
-                if entry == "credential" and state.credentials:
-                    entry_met = True
-                    entry_point = "credential"
-                elif entry == "shell_access" and any("shell" in str(a).lower() for a in state.executed_actions):
-                    entry_met = True
-                    entry_point = "shell"
-                elif any(v.get("type") == entry for v in state.vulnerabilities):
-                    entry_met = True
-                    entry_point = entry
-
-            if entry_met:
-                # Build chain steps
-                steps = []
-                for step in template["steps"]:
-                    action = self._build_chain_action(step, state)
-                    if action:
-                        steps.append(action)
-
-                if steps:
-                    chains.append(ExploitChain(
-                        name=chain_name,
-                        steps=steps,
+        # Credentials to access
+        if state.credentials:
+            for cred in state.credentials:
+                chains.append(ExploitChain(
+                    name="cred_access",
+                    steps=[PentestAction(
+                        tool="hydra",
                         target=state.targets[0] if state.targets else "",
-                        entry_point=entry_point,
-                        expected_access=template["outcome"],
-                        confidence=0.7
-                    ))
-
-        # Use LLM to identify custom chains
-        llm_chains = await self._identify_chains_with_llm(state)
-        chains.extend(llm_chains)
+                        options={"username": cred.get("value", "")},
+                        reasoning="Try discovered credentials",
+                        priority=9
+                    )],
+                    target=state.targets[0] if state.targets else "",
+                    entry_point="credential",
+                    expected_access="authenticated",
+                    confidence=0.7
+                ))
 
         return chains
-
-    def _build_chain_action(
-        self,
-        step: Dict,
-        state: AgentState
-    ) -> Optional[PentestAction]:
-        """Build a chain action from step definition."""
-        action_map = {
-            "sqlmap_dump": lambda: PentestAction(
-                tool="sqlmap",
-                target=state.targets[0],
-                options={"dbs": True, "dump": True},
-                reasoning="Dump database via SQL injection",
-                priority=9
-            ),
-            "reverse_shell": lambda: PentestAction(
-                tool="revshell_generator",
-                target="bash",
-                options={"lhost": "ATTACKER_IP", "lport": 4444},
-                reasoning="Generate reverse shell payload",
-                priority=9
-            ),
-            "linpeas": lambda: PentestAction(
-                tool="linpeas",
-                target="localhost",
-                options={"quick": True},
-                reasoning="Enumerate privilege escalation vectors",
-                priority=8
-            ),
-            "ssh_login": lambda: PentestAction(
-                tool="ssh",
-                target=state.targets[0],
-                options={"username": state.credentials[0].get("username") if state.credentials else ""},
-                reasoning="Attempt SSH login with discovered credentials",
-                priority=9
-            ),
-        }
-
-        action_name = step.get("action")
-        if action_name in action_map:
-            return action_map[action_name]()
-        return None
-
-    async def _identify_chains_with_llm(
-        self,
-        state: AgentState
-    ) -> List[ExploitChain]:
-        """Use LLM to identify custom exploit chains."""
-        prompt = f"""Analyze the current pentest state and identify potential exploit chains.
-
-## State
-Services: {json.dumps(state.services, indent=2)[:1000]}
-Vulnerabilities: {json.dumps(state.vulnerabilities, indent=2)[:500]}
-Credentials: {json.dumps(state.credentials, indent=2)[:300]}
-Current Access: {state.phase}
-
-## Instructions
-Identify 1-2 realistic exploit chains that could lead to:
-1. Initial access
-2. Privilege escalation
-3. Lateral movement
-
-Return JSON:
-[
-    {{
-        "name": "chain_name",
-        "entry_point": "vulnerability or access type",
-        "steps": [
-            {{"tool": "...", "target": "...", "options": {{}}, "reasoning": "..."}}
-        ],
-        "expected_access": "user|root|admin",
-        "confidence": 0.0-1.0
-    }}
-]"""
-
-        try:
-            response = await self.llm_client._call_llm(prompt)
-            json_match = re.search(r'\[[\s\S]*\]', response)
-            if json_match:
-                chains_data = json.loads(json_match.group())
-                chains = []
-                for chain in chains_data:
-                    steps = [
-                        PentestAction(
-                            tool=s.get("tool", ""),
-                            target=s.get("target", ""),
-                            options=s.get("options", {}),
-                            reasoning=s.get("reasoning", ""),
-                            priority=8
-                        )
-                        for s in chain.get("steps", [])
-                    ]
-                    chains.append(ExploitChain(
-                        name=chain.get("name", "custom_chain"),
-                        steps=steps,
-                        target=state.targets[0] if state.targets else "",
-                        entry_point=chain.get("entry_point", ""),
-                        expected_access=chain.get("expected_access", "user"),
-                        confidence=chain.get("confidence", 0.5)
-                    ))
-                return chains
-        except Exception as e:
-            logger.warning(f"LLM chain identification failed: {e}")
-
-        return []
 
     async def execute_chain(
         self,
@@ -924,46 +742,26 @@ Return JSON:
         state: AgentState,
         on_step_complete: Optional[callable] = None
     ) -> Dict[str, Any]:
-        """
-        Execute an exploit chain step by step.
-
-        Args:
-            chain: The exploit chain to execute
-            state: Current agent state
-            on_step_complete: Callback for each completed step
-
-        Returns:
-            Chain execution results
-        """
+        """Execute an exploit chain."""
         results = {
             "chain_name": chain.name,
             "steps_executed": 0,
             "steps_successful": 0,
-            "final_access": None,
             "step_results": []
         }
 
-        for i, step in enumerate(chain.steps):
-            logger.info(
-                f"Executing chain step {i+1}/{len(chain.steps)}",
-                chain=chain.name,
-                tool=step.tool
-            )
-
+        for step in chain.steps:
             try:
-                # Execute step
                 request = ExecutionRequest(
                     tool_name=step.tool,
                     target=step.target,
                     options=step.options,
                     session_id=state.session_id,
-                    approved=True  # Auto-approve in agent mode
+                    approved=True
                 )
-
                 response = await self.mcp_engine.execute(request)
 
                 step_result = {
-                    "step": i + 1,
                     "tool": step.tool,
                     "success": response.success,
                     "output": response.result.output if response.result else ""
@@ -973,21 +771,13 @@ Return JSON:
 
                 if response.success:
                     results["steps_successful"] += 1
-
                     if on_step_complete:
                         await on_step_complete(step, response)
                 else:
-                    # Chain broken - stop execution
-                    logger.warning(f"Chain step failed: {step.tool}")
                     break
-
             except Exception as e:
                 logger.error(f"Chain step error: {e}")
                 break
-
-        # Determine final access level
-        if results["steps_successful"] == len(chain.steps):
-            results["final_access"] = chain.expected_access
 
         return results
 
@@ -995,13 +785,7 @@ Return JSON:
 class AutonomousAgent:
     """
     Main autonomous pentesting agent.
-
-    Implements PentestGPT-style autonomous loop:
-    1. Execute tool
-    2. Extract data from output
-    3. Decide next action
-    4. Chain exploits automatically
-    5. Repeat until objective achieved
+    PentestGPT-style: execute → extract → decide → repeat
     """
 
     def __init__(
@@ -1020,16 +804,20 @@ class AutonomousAgent:
         self.mcp_engine = mcp_engine or MCPEngine()
         self.memory_manager = memory_manager
 
-        # Initialize components
+        # Normalize targets
+        normalized_targets = []
+        for t in targets:
+            url, _, _ = normalize_target(t)
+            normalized_targets.append(url)
+
         self.extractor = DataExtractor(self.llm_client)
         self.decision_engine = DecisionEngine(self.llm_client)
         self.exploit_chainer = ExploitChainer(self.llm_client, self.mcp_engine)
 
-        # Initialize state
         self.state = AgentState(
             session_id=session_id,
             objective=objective,
-            targets=targets,
+            targets=normalized_targets,
             max_iterations=max_iterations
         )
 
@@ -1044,12 +832,7 @@ class AutonomousAgent:
             "on_complete": [],
         }
 
-        logger.info(
-            "Autonomous agent initialized",
-            session_id=session_id,
-            targets=targets,
-            objective=objective
-        )
+        logger.info(f"Autonomous agent initialized for {normalized_targets}")
 
     def on(self, event: str, callback: callable):
         """Register event callback."""
@@ -1068,19 +851,9 @@ class AutonomousAgent:
                 logger.error(f"Callback error: {e}")
 
     async def run(self) -> AgentState:
-        """
-        Run the autonomous agent loop.
-
-        Returns:
-            Final agent state
-        """
+        """Run the autonomous agent loop."""
         self._running = True
-
-        logger.info(
-            "Starting autonomous agent",
-            session_id=self.session_id,
-            phase=self.state.phase
-        )
+        logger.info(f"Starting autonomous agent: {self.state.targets}")
 
         try:
             while self._running and self.state.iteration < self.state.max_iterations:
@@ -1089,20 +862,16 @@ class AutonomousAgent:
                     continue
 
                 self.state.iteration += 1
+                logger.info(f"=== Iteration {self.state.iteration} ===")
 
-                logger.info(
-                    f"Iteration {self.state.iteration}/{self.state.max_iterations}",
-                    phase=self.state.phase
-                )
-
-                # Step 1: Determine phase
+                # Check phase
                 new_phase = self.decision_engine.determine_phase(self.state)
                 if new_phase != self.state.phase:
-                    logger.info(f"Phase transition: {self.state.phase} -> {new_phase}")
+                    logger.info(f"Phase: {self.state.phase} -> {new_phase}")
                     self.state.phase = new_phase
                     await self._emit("on_phase_change", {"old": self.state.phase, "new": new_phase})
 
-                # Step 2: Decide next actions
+                # Decide actions
                 last_result = self.state.executed_actions[-1] if self.state.executed_actions else None
                 actions = await self.decision_engine.decide_next_actions(self.state, last_result)
 
@@ -1110,28 +879,25 @@ class AutonomousAgent:
                     logger.info("No more actions to take")
                     break
 
-                # Step 3: Execute actions
+                # Execute actions
                 for action in actions:
                     if not self._running:
                         break
 
                     result = await self._execute_action(action)
-
                     if result:
-                        # Step 4: Extract data from output
-                        extractions = await self._process_result(action, result)
+                        await self._process_result(action, result)
 
-                        # Step 5: Check for exploit chains
+                        # Check for exploit chains
                         if self.auto_exploit and self.state.phase in ["vulnerability_analysis", "exploitation"]:
                             await self._check_and_execute_chains()
 
-                        # Step 6: Check objectives
+                        # Check objectives
                         if self._check_objectives():
-                            logger.info("Objectives achieved!")
+                            logger.info("🎯 Objectives achieved!")
                             self._running = False
                             break
 
-                # Small delay between iterations
                 await asyncio.sleep(0.5)
 
         except Exception as e:
@@ -1144,61 +910,133 @@ class AutonomousAgent:
         return self.state
 
     async def _execute_action(self, action: PentestAction) -> Optional[Dict]:
-        """Execute a single action."""
-        logger.info(
-            f"Executing action: {action.tool}",
-            target=action.target,
-            reasoning=action.reasoning
-        )
-
+        """Execute a single action using real tools."""
+        logger.info(f"Executing: {action.tool} -> {action.target}")
         await self._emit("on_action", action)
 
         try:
+            # Try MCP engine first
             request = ExecutionRequest(
                 tool_name=action.tool,
                 target=action.target,
                 options=action.options,
                 session_id=self.session_id,
-                approved=True  # Auto-approve in autonomous mode
+                approved=True
             )
 
             response = await self.mcp_engine.execute(request)
 
-            result = {
-                "tool": action.tool,
-                "target": action.target,
-                "success": response.success,
-                "output": response.result.output if response.result else "",
-                "parsed_data": response.result.parsed_data if response.result else {},
-                "error": response.error,
-                "timestamp": datetime.utcnow().isoformat()
-            }
+            if response.success and response.result:
+                result = {
+                    "tool": action.tool,
+                    "target": action.target,
+                    "success": True,
+                    "output": response.result.output,
+                    "parsed_data": response.result.parsed_data,
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            else:
+                # Fallback to direct command execution
+                result = await self._execute_command_directly(action)
 
             self.state.executed_actions.append(result)
-
-            # Store in memory if available
-            if self.memory_manager:
-                await self.memory_manager.store_tool_result(
-                    self.session_id,
-                    action.tool,
-                    result
-                )
-
             return result
 
         except Exception as e:
             logger.error(f"Action execution failed: {e}")
-            return None
+            # Try direct execution as fallback
+            return await self._execute_command_directly(action)
 
-    async def _process_result(
-        self,
-        action: PentestAction,
-        result: Dict
-    ) -> List[ExtractedData]:
+    async def _execute_command_directly(self, action: PentestAction) -> Dict:
+        """Execute command directly using subprocess."""
+        cmd = self._build_command(action)
+        logger.info(f"Direct execution: {cmd}")
+
+        try:
+            process = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            output = stdout.decode() + stderr.decode()
+
+            result = {
+                "tool": action.tool,
+                "target": action.target,
+                "success": process.returncode == 0,
+                "output": output,
+                "parsed_data": {},
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            self.state.executed_actions.append(result)
+            return result
+
+        except asyncio.TimeoutError:
+            return {
+                "tool": action.tool,
+                "target": action.target,
+                "success": False,
+                "output": "Command timed out",
+                "parsed_data": {},
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            return {
+                "tool": action.tool,
+                "target": action.target,
+                "success": False,
+                "output": str(e),
+                "parsed_data": {},
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+    def _build_command(self, action: PentestAction) -> str:
+        """Build shell command from action."""
+        tool = action.tool
+        target = action.target
+        opts = action.options
+
+        if tool == "curl":
+            cmd = f"curl -sS -i -L --connect-timeout 10 '{target}'"
+        elif tool == "whatweb":
+            cmd = f"whatweb -a 3 --color=never '{target}'"
+        elif tool == "nmap":
+            scan_type = opts.get("scan_type", "")
+            ports = opts.get("ports", "")
+            cmd = f"nmap -sV"
+            if ports:
+                cmd += f" -p {ports}"
+            cmd += f" {target}"
+        elif tool == "gobuster":
+            wordlist = opts.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+            extensions = opts.get("extensions", "php,html,txt")
+            cmd = f"gobuster dir -u '{target}' -w {wordlist} -x {extensions} -q -t 20"
+        elif tool == "ffuf":
+            wordlist = opts.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
+            cmd = f"ffuf -u '{target}/FUZZ' -w {wordlist} -mc 200,301,302,403 -s"
+        elif tool == "nikto":
+            cmd = f"nikto -h '{target}' -Tuning 123bde -timeout 10"
+        elif tool == "sqlmap":
+            cmd = f"sqlmap -u '{target}' --batch --level=2 --risk=2 --threads=5"
+        elif tool == "searchsploit":
+            cmd = f"searchsploit --json '{target}'"
+        elif tool == "hydra":
+            service = opts.get("service", "ssh")
+            username = opts.get("username", "admin")
+            passlist = opts.get("password_list", "/usr/share/wordlists/rockyou.txt")
+            host = target.replace("http://", "").replace("https://", "").split(":")[0]
+            cmd = f"hydra -l {username} -P {passlist} -t 4 {host} {service}"
+        else:
+            cmd = f"{tool} {target}"
+
+        return cmd
+
+    async def _process_result(self, action: PentestAction, result: Dict):
         """Process tool result and extract data."""
         output = result.get("output", "")
         if not output:
-            return []
+            return
 
         # Extract data
         extractions = await self.extractor.extract_with_llm(
@@ -1208,20 +1046,15 @@ class AutonomousAgent:
             objective=self.state.objective
         )
 
-        # Update state with extractions
+        # Update state
         for extraction in extractions:
             self.state.extracted_data.append(extraction)
 
-            # Categorize extraction
             if extraction.type == ExtractionType.SERVICE:
                 host = action.target.split(":")[0].replace("http://", "").replace("https://", "")
                 if host not in self.state.services:
                     self.state.services[host] = []
-                self.state.services[host].append({
-                    "name": extraction.value,
-                    "port": extraction.metadata.get("port"),
-                    "version": extraction.metadata.get("version")
-                })
+                self.state.services[host].append({"name": extraction.value})
 
             elif extraction.type == ExtractionType.CREDENTIAL:
                 self.state.credentials.append({
@@ -1229,6 +1062,7 @@ class AutonomousAgent:
                     "context": extraction.context,
                     "source": extraction.source_tool
                 })
+                logger.info(f"🔑 Credential found: {extraction.value[:20]}...")
 
             elif extraction.type == ExtractionType.ENDPOINT:
                 if extraction.value not in self.state.endpoints:
@@ -1241,120 +1075,76 @@ class AutonomousAgent:
                     "confidence": extraction.confidence,
                     "context": extraction.context
                 })
+                logger.info(f"⚠️ Vulnerability found: {extraction.value}")
 
             elif extraction.type == ExtractionType.FLAG:
                 if extraction.value not in self.state.flags_found:
                     self.state.flags_found.append(extraction.value)
-                    logger.info(f"FLAG FOUND: {extraction.value}")
+                    logger.info(f"🚩 FLAG FOUND: {extraction.value}")
+
+            elif extraction.type == ExtractionType.VERSION:
+                logger.info(f"📋 Version found: {extraction.value}")
 
             await self._emit("on_extraction", extraction)
 
-        # Parse service information from nmap
-        if action.tool == "nmap" and result.get("parsed_data"):
-            self._process_nmap_results(result["parsed_data"], action.target)
+        # Parse nmap results specifically
+        if action.tool == "nmap":
+            self._process_nmap_output(result.get("output", ""), action.target)
 
-        logger.info(
-            f"Extracted {len(extractions)} items",
-            types=[e.type.value for e in extractions]
-        )
+    def _process_nmap_output(self, output: str, target: str):
+        """Parse nmap text output."""
+        host = target.replace("http://", "").replace("https://", "").split(":")[0]
+        if host not in self.state.services:
+            self.state.services[host] = []
 
-        return extractions
-
-    def _process_nmap_results(self, parsed_data: Dict, target: str):
-        """Process structured nmap results."""
-        for host in parsed_data.get("hosts", []):
-            host_addr = None
-            for addr in host.get("addresses", []):
-                if addr.get("type") == "ipv4":
-                    host_addr = addr.get("addr")
-                    break
-
-            if not host_addr:
-                host_addr = target
-
-            if host_addr not in self.state.services:
-                self.state.services[host_addr] = []
-
-            for port in host.get("ports", []):
-                if port.get("state") == "open":
-                    service = port.get("service", {})
-                    self.state.services[host_addr].append({
-                        "port": port.get("portid"),
-                        "protocol": port.get("protocol"),
-                        "name": service.get("name", "unknown"),
-                        "product": service.get("product"),
-                        "version": service.get("version")
-                    })
+        # Parse port lines
+        for line in output.split("\n"):
+            match = re.match(r'(\d+)/(tcp|udp)\s+open\s+(\S+)', line)
+            if match:
+                port, proto, service = match.groups()
+                version_match = re.search(r'(\S+\s+[\d.]+)', line)
+                self.state.services[host].append({
+                    "port": int(port),
+                    "protocol": proto,
+                    "name": service,
+                    "version": version_match.group(1) if version_match else None
+                })
 
     async def _check_and_execute_chains(self):
         """Check for and execute exploit chains."""
         chains = await self.exploit_chainer.identify_chains(self.state)
-
         for chain in chains:
             if chain.confidence >= 0.7:
-                logger.info(
-                    f"Executing exploit chain: {chain.name}",
-                    confidence=chain.confidence,
-                    steps=len(chain.steps)
-                )
-
+                logger.info(f"Executing exploit chain: {chain.name}")
                 await self._emit("on_chain_start", chain)
-
-                result = await self.exploit_chainer.execute_chain(
-                    chain,
-                    self.state,
-                    on_step_complete=self._on_chain_step
-                )
-
+                result = await self.exploit_chainer.execute_chain(chain, self.state)
                 self.state.exploit_chains.append(chain)
-
                 if result.get("final_access"):
                     self.state.objectives_completed.append(result["final_access"])
-
-    async def _on_chain_step(self, step: PentestAction, response):
-        """Callback for chain step completion."""
-        if response.result:
-            await self._process_result(step, {
-                "tool": step.tool,
-                "target": step.target,
-                "output": response.result.output,
-                "parsed_data": response.result.parsed_data
-            })
 
     def _check_objectives(self) -> bool:
         """Check if objectives have been achieved."""
         objective_lower = self.state.objective.lower()
 
-        # Check for flag-based objectives
         if "flag" in objective_lower or "ctf" in objective_lower:
             return len(self.state.flags_found) > 0
 
-        # Check for access-based objectives
-        if "root" in objective_lower:
-            return "root_access" in self.state.objectives_completed
-        if "user" in objective_lower:
-            return "user_access" in self.state.objectives_completed or "authenticated_access" in self.state.objectives_completed
-
-        # Check for vulnerability-based objectives
         if "vulnerab" in objective_lower:
-            return len(self.state.vulnerabilities) > 0
+            return len(self.state.vulnerabilities) >= 3
+
+        if "credential" in objective_lower:
+            return len(self.state.credentials) > 0
 
         return False
 
     def pause(self):
-        """Pause the agent."""
         self.state.paused = True
-        logger.info("Agent paused")
 
     def resume(self):
-        """Resume the agent."""
         self.state.paused = False
-        logger.info("Agent resumed")
 
     def stop(self):
-        """Stop the agent."""
         self._running = False
-        logger.info("Agent stopped")
 
     def get_state(self) -> Dict[str, Any]:
         """Get current agent state as dictionary."""
@@ -1378,7 +1168,7 @@ class AutonomousAgent:
         }
 
     def get_summary(self) -> str:
-        """Get human-readable summary of agent progress."""
+        """Get human-readable summary."""
         state = self.get_state()
         return f"""
 Autonomous Agent Summary
@@ -1386,7 +1176,7 @@ Autonomous Agent Summary
 Session: {state['session_id']}
 Objective: {state['objective']}
 Phase: {state['phase']}
-Progress: {state['iteration']}/{state['max_iterations']} iterations
+Progress: {state['iteration']}/{state['max_iterations']}
 
 Discoveries:
 - Services: {state['services_discovered']}
@@ -1394,17 +1184,11 @@ Discoveries:
 - Endpoints: {state['endpoints_found']}
 - Vulnerabilities: {state['vulnerabilities_found']}
 
-Achievements:
-- Flags: {state['flags_found']}
-- Access Levels: {state['objectives_completed']}
-- Exploit Chains: {state['exploit_chains_executed']}
-
+Flags Found: {state['flags_found']}
 Actions Executed: {state['actions_executed']}
-Status: {'Paused' if state['paused'] else 'Running' if self._running else 'Stopped'}
 """
 
 
-# Factory function for easy creation
 async def create_autonomous_agent(
     session_id: str,
     objective: str,
@@ -1412,29 +1196,13 @@ async def create_autonomous_agent(
     auto_exploit: bool = False,
     max_iterations: int = 100
 ) -> AutonomousAgent:
-    """
-    Create and configure an autonomous agent.
-
-    Args:
-        session_id: Session identifier
-        objective: Pentest objective (e.g., "capture the flag", "find vulnerabilities")
-        targets: List of targets to test
-        auto_exploit: Enable automatic exploitation
-        max_iterations: Maximum iterations before stopping
-
-    Returns:
-        Configured AutonomousAgent instance
-    """
+    """Create and configure an autonomous agent."""
     from ..tools.kali_tools import register_all_tools
 
-    # Initialize components
     llm_client = LLMClient()
     mcp_engine = MCPEngine()
-
-    # Register tools
     register_all_tools(mcp_engine)
 
-    # Create agent
     agent = AutonomousAgent(
         session_id=session_id,
         objective=objective,
