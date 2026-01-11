@@ -13,6 +13,10 @@ from .state import PentestState, Task, TaskStatus, Target, AgentState, Finding, 
 from .llm_client import LLMClient
 from ..config import settings, RiskLevel
 
+# Import database models for progressive sync
+from ..models.database import async_session_factory
+from ..models.schemas import TaskModel, TaskStatus as DBTaskStatus, FindingModel, SeverityLevel as DBSeverityLevel
+
 logger = structlog.get_logger()
 
 
@@ -273,6 +277,11 @@ class PentestOrchestrator:
             target_tasks = await self._generate_initial_tasks(target, state.user_objective)
             tasks.extend(target_tasks)
             task_queue.extend([t.id for t in target_tasks])
+
+            # Sync tasks to database immediately so frontend can see them
+            for task in target_tasks:
+                await self._sync_task_to_db(state.session_id, task)
+                await self._send_task_progress(state.session_id, task.id, "pending", f"Task created: {task.name}")
 
             await self._send_activity(
                 state.session_id,
@@ -716,6 +725,12 @@ class PentestOrchestrator:
                 task.result = result
                 if error:
                     task.error = error
+                # Sync task progress to database and notify frontend
+                await self._sync_task_to_db(state.session_id, task)
+                await self._send_task_progress(
+                    state.session_id, task.id, "in_progress",
+                    f"Executing: {task.name}"
+                )
             updated_tasks.append(task)
 
         return {
@@ -761,11 +776,22 @@ class PentestOrchestrator:
                 task.status = task_status
                 task.completed_at = datetime.utcnow()
                 completed_tasks.append(task.id)
+                # Sync completed task to database and notify frontend
+                await self._sync_task_to_db(state.session_id, task)
+                await self._send_task_progress(
+                    state.session_id, task.id,
+                    "completed" if task_status == TaskStatus.COMPLETED else "failed",
+                    f"Task complete: {task.name}"
+                )
 
         # Generate findings from static parsing
         new_findings = []
         if current_task.result and current_task.result.get("status") == "success":
             new_findings = self._generate_findings_from_result(current_task, state)
+            # Sync findings to database and notify frontend
+            for finding in new_findings:
+                await self._sync_finding_to_db(state.session_id, finding, current_task.target_id)
+                await self._send_finding_notification(state.session_id, finding)
 
         # Use LLM for intelligent analysis and dynamic task generation
         new_tasks = []
@@ -806,7 +832,7 @@ class PentestOrchestrator:
                         "low": SeverityLevel.LOW,
                         "info": SeverityLevel.INFO
                     }
-                    new_findings.append(Finding(
+                    finding = Finding(
                         id=str(uuid.uuid4()),
                         title=llm_finding.get("title", "Finding"),
                         description=llm_finding.get("description", ""),
@@ -816,7 +842,11 @@ class PentestOrchestrator:
                         evidence=llm_finding.get("evidence", ""),
                         remediation=llm_finding.get("remediation", ""),
                         discovered_at=datetime.utcnow()
-                    ))
+                    )
+                    new_findings.append(finding)
+                    # Sync LLM findings to database and notify frontend
+                    await self._sync_finding_to_db(state.session_id, finding, target.id if target else None)
+                    await self._send_finding_notification(state.session_id, finding)
 
                 # Create dynamic tasks from LLM recommendations
                 for llm_task in llm_analysis.get("next_tasks", []):
@@ -832,6 +862,9 @@ class PentestOrchestrator:
                             requires_approval=llm_task.get("risk_level") in ["high", "critical"]
                         )
                         new_tasks.append(new_task)
+                        # Sync new tasks to database
+                        await self._sync_task_to_db(state.session_id, new_task)
+                        await self._send_task_progress(state.session_id, new_task.id, "pending", f"New task: {new_task.name}")
 
                         await self._send_activity(
                             state.session_id,
@@ -891,6 +924,7 @@ class PentestOrchestrator:
         """Send activity update to frontend via WebSocket."""
         if self.ws_manager:
             try:
+                # Use proper message types that frontend expects for cache invalidation
                 await self.ws_manager.send_to_session(session_id, {
                     "type": "activity",
                     "activity_type": activity_type,
@@ -899,6 +933,129 @@ class PentestOrchestrator:
                 })
             except Exception as e:
                 logger.debug(f"Failed to send activity: {e}")
+
+    async def _send_task_progress(self, session_id: str, task_id: str, status: str, message: str = ""):
+        """Send task progress update - triggers frontend cache refresh."""
+        if self.ws_manager:
+            try:
+                await self.ws_manager.send_progress_update(
+                    session_id=session_id,
+                    task_id=task_id,
+                    progress=100 if status == "completed" else 50,
+                    status=status,
+                    message=message
+                )
+            except Exception as e:
+                logger.debug(f"Failed to send progress: {e}")
+
+    async def _send_finding_notification(self, session_id: str, finding: Finding):
+        """Send finding notification - triggers frontend cache refresh."""
+        if self.ws_manager:
+            try:
+                await self.ws_manager.send_finding(
+                    session_id=session_id,
+                    finding={
+                        "id": finding.id,
+                        "title": finding.title,
+                        "severity": finding.severity.value if hasattr(finding.severity, 'value') else finding.severity,
+                        "category": finding.category,
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Failed to send finding: {e}")
+
+    async def _sync_task_to_db(self, session_id: str, task: Task):
+        """Progressively sync a task to the database."""
+        status_map = {
+            "pending": DBTaskStatus.PENDING,
+            "in_progress": DBTaskStatus.IN_PROGRESS,
+            "waiting_approval": DBTaskStatus.WAITING_APPROVAL,
+            "approved": DBTaskStatus.APPROVED,
+            "rejected": DBTaskStatus.REJECTED,
+            "completed": DBTaskStatus.COMPLETED,
+            "failed": DBTaskStatus.FAILED,
+        }
+
+        try:
+            async with async_session_factory() as db:
+                from sqlalchemy import select
+                result = await db.execute(
+                    select(TaskModel).where(TaskModel.id == task.id)
+                )
+                existing = result.scalar_one_or_none()
+
+                task_status = task.status.value if hasattr(task.status, 'value') else str(task.status)
+
+                if existing:
+                    existing.status = status_map.get(task_status, DBTaskStatus.PENDING)
+                    existing.result = task.result
+                    existing.error = task.error
+                    existing.started_at = task.started_at
+                    existing.completed_at = task.completed_at
+                else:
+                    db_task = TaskModel(
+                        id=task.id,
+                        session_id=session_id,
+                        target_id=task.target_id,
+                        name=task.name,
+                        task_type=task.task_type,
+                        status=status_map.get(task_status, DBTaskStatus.PENDING),
+                        tool=task.tool,
+                        parameters=task.parameters or {},
+                        risk_level=task.risk_level,
+                        requires_approval=task.requires_approval,
+                        result=task.result,
+                        error=task.error,
+                        started_at=task.started_at,
+                        completed_at=task.completed_at,
+                    )
+                    db.add(db_task)
+
+                await db.commit()
+                logger.debug(f"Synced task {task.id} to database")
+        except Exception as e:
+            logger.error(f"Failed to sync task to database: {e}")
+
+    async def _sync_finding_to_db(self, session_id: str, finding: Finding, target_id: str = None):
+        """Progressively sync a finding to the database."""
+        severity_map = {
+            "info": DBSeverityLevel.INFO,
+            "low": DBSeverityLevel.LOW,
+            "medium": DBSeverityLevel.MEDIUM,
+            "high": DBSeverityLevel.HIGH,
+            "critical": DBSeverityLevel.CRITICAL,
+        }
+
+        try:
+            async with async_session_factory() as db:
+                from sqlalchemy import select
+                result = await db.execute(
+                    select(FindingModel).where(FindingModel.id == finding.id)
+                )
+                existing = result.scalar_one_or_none()
+
+                if not existing:
+                    severity = finding.severity.value if hasattr(finding.severity, 'value') else str(finding.severity)
+                    db_finding = FindingModel(
+                        id=finding.id,
+                        session_id=session_id,
+                        target_id=target_id,
+                        title=finding.title,
+                        description=finding.description,
+                        severity=severity_map.get(severity.lower(), DBSeverityLevel.INFO),
+                        category=finding.category,
+                        evidence=finding.evidence,
+                        remediation=finding.remediation,
+                        cve_ids=finding.cve_ids if hasattr(finding, 'cve_ids') else [],
+                        cvss_score=finding.cvss_score if hasattr(finding, 'cvss_score') else None,
+                        verified=finding.verified if hasattr(finding, 'verified') else False,
+                        discovered_at=finding.discovered_at,
+                    )
+                    db.add(db_finding)
+                    await db.commit()
+                    logger.debug(f"Synced finding {finding.id} to database")
+        except Exception as e:
+            logger.error(f"Failed to sync finding to database: {e}")
 
     def _generate_findings_from_result(self, task: Task, state: PentestState) -> List[Finding]:
         """
