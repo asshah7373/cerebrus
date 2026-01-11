@@ -110,28 +110,125 @@ def normalize_target(target: str) -> Tuple[str, str, int]:
     """
     Normalize target to standard format.
     Returns (normalized_url, host, port)
+    Note: Returns http:// by default, probe_protocol() should be called to detect actual protocol
     """
-    # Remove any protocol prefix for parsing
-    clean = target.replace("http://", "").replace("https://", "")
+    # If already has protocol, respect it
+    if target.startswith("https://"):
+        clean = target.replace("https://", "")
+        if ":" in clean:
+            host, port_str = clean.rsplit(":", 1)
+            try:
+                port = int(port_str.split("/")[0])
+            except ValueError:
+                port = 443
+        else:
+            host = clean.split("/")[0]
+            port = 443
+        return f"https://{host}:{port}", host, port
+    elif target.startswith("http://"):
+        clean = target.replace("http://", "")
+        if ":" in clean:
+            host, port_str = clean.rsplit(":", 1)
+            try:
+                port = int(port_str.split("/")[0])
+            except ValueError:
+                port = 80
+        else:
+            host = clean.split("/")[0]
+            port = 80
+        return f"http://{host}:{port}", host, port
 
-    # Parse host and port
+    # No protocol specified - parse host:port
+    clean = target
     if ":" in clean:
         host, port_str = clean.rsplit(":", 1)
         try:
-            port = int(port_str.split("/")[0])  # Handle paths after port
+            port = int(port_str.split("/")[0])
         except ValueError:
             port = 80
     else:
         host = clean.split("/")[0]
         port = 80
 
-    # Determine if HTTPS based on port
-    if port == 443:
+    # Return both http and https URLs for probing - caller should probe
+    # Default to http, but common HTTPS ports use https
+    if port in [443, 8443]:
         url = f"https://{host}:{port}"
     else:
         url = f"http://{host}:{port}"
 
     return url, host, port
+
+
+async def probe_protocol(host: str, port: int, timeout: float = 5.0) -> str:
+    """
+    Probe target to determine if it's HTTP or HTTPS.
+    Returns the working URL with correct protocol.
+    """
+    import ssl
+    import socket
+
+    # Try HTTPS first (more common for modern apps)
+    https_url = f"https://{host}:{port}"
+    http_url = f"http://{host}:{port}"
+
+    # Quick SSL check
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                # SSL handshake succeeded - it's HTTPS
+                logger.info(f"SSL handshake succeeded for {host}:{port} - using HTTPS")
+                return https_url
+    except (ssl.SSLError, socket.error, OSError, ConnectionRefusedError) as e:
+        logger.debug(f"SSL probe failed for {host}:{port}: {e}")
+
+    # Try HTTP with curl (more reliable)
+    try:
+        process = await asyncio.wait_for(
+            asyncio.create_subprocess_shell(
+                f"curl -sS -o /dev/null -w '%{{http_code}}' --connect-timeout 3 -k '{https_url}'",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            ),
+            timeout=timeout
+        )
+        stdout, _ = await process.communicate()
+        status = stdout.decode().strip()
+        if status and status != '000':
+            logger.info(f"HTTPS responded with {status} for {host}:{port}")
+            return https_url
+    except Exception as e:
+        logger.debug(f"HTTPS curl probe failed: {e}")
+
+    # Fall back to HTTP
+    try:
+        process = await asyncio.wait_for(
+            asyncio.create_subprocess_shell(
+                f"curl -sS -o /dev/null -w '%{{http_code}}' --connect-timeout 3 '{http_url}'",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            ),
+            timeout=timeout
+        )
+        stdout, _ = await process.communicate()
+        status = stdout.decode().strip()
+        if status and status != '000':
+            logger.info(f"HTTP responded with {status} for {host}:{port}")
+            return http_url
+    except Exception as e:
+        logger.debug(f"HTTP curl probe failed: {e}")
+
+    # Default to HTTPS for non-standard ports (often apps use HTTPS)
+    if port not in [80, 8080]:
+        logger.info(f"Defaulting to HTTPS for {host}:{port}")
+        return https_url
+
+    logger.info(f"Defaulting to HTTP for {host}:{port}")
+    return http_url
 
 
 class DataExtractor:
@@ -804,11 +901,8 @@ class AutonomousAgent:
         self.mcp_engine = mcp_engine or MCPEngine()
         self.memory_manager = memory_manager
 
-        # Normalize targets
-        normalized_targets = []
-        for t in targets:
-            url, _, _ = normalize_target(t)
-            normalized_targets.append(url)
+        # Store raw targets for protocol probing later
+        self._raw_targets = targets
 
         self.extractor = DataExtractor(self.llm_client)
         self.decision_engine = DecisionEngine(self.llm_client)
@@ -817,12 +911,13 @@ class AutonomousAgent:
         self.state = AgentState(
             session_id=session_id,
             objective=objective,
-            targets=normalized_targets,
+            targets=[],  # Will be populated after probing
             max_iterations=max_iterations
         )
 
         self.auto_exploit = auto_exploit
         self._running = False
+        self._probed = False
         self._callbacks: Dict[str, List[callable]] = {
             "on_action": [],
             "on_extraction": [],
@@ -832,7 +927,7 @@ class AutonomousAgent:
             "on_complete": [],
         }
 
-        logger.info(f"Autonomous agent initialized for {normalized_targets}")
+        logger.info(f"Autonomous agent initialized for {targets}")
 
     def on(self, event: str, callback: callable):
         """Register event callback."""
@@ -850,9 +945,42 @@ class AutonomousAgent:
             except Exception as e:
                 logger.error(f"Callback error: {e}")
 
+    async def _probe_targets(self):
+        """Probe all targets to determine correct protocol (HTTP/HTTPS)."""
+        logger.info("Probing targets to detect HTTP/HTTPS...")
+
+        probed_targets = []
+        for target in self._raw_targets:
+            # If target already has protocol, respect it
+            if target.startswith("http://") or target.startswith("https://"):
+                url, _, _ = normalize_target(target)
+                probed_targets.append(url)
+                continue
+
+            # Parse and probe
+            _, host, port = normalize_target(target)
+            try:
+                url = await probe_protocol(host, port)
+                logger.info(f"Target {target} -> {url}")
+                probed_targets.append(url)
+            except Exception as e:
+                # Fallback to default
+                url, _, _ = normalize_target(target)
+                logger.warning(f"Probe failed for {target}, defaulting to {url}: {e}")
+                probed_targets.append(url)
+
+        self.state.targets = probed_targets
+        self._probed = True
+        logger.info(f"Probed targets: {probed_targets}")
+
     async def run(self) -> AgentState:
         """Run the autonomous agent loop."""
         self._running = True
+
+        # Probe protocols first
+        if not self._probed:
+            await self._probe_targets()
+
         logger.info(f"Starting autonomous agent: {self.state.targets}")
 
         try:
