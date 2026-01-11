@@ -110,7 +110,7 @@ def create_app() -> FastAPI:
     )
 
     # Import routes here to avoid circular imports
-    from .routes import sessions, targets, tasks, findings, tools, settings as settings_routes
+    from .routes import sessions, targets, tasks, findings, tools, settings as settings_routes, agent
 
     # Include routers
     app.include_router(sessions.router, prefix="/api/sessions", tags=["Sessions"])
@@ -119,6 +119,7 @@ def create_app() -> FastAPI:
     app.include_router(findings.router, prefix="/api/findings", tags=["Findings"])
     app.include_router(tools.router, prefix="/api/tools", tags=["Tools"])
     app.include_router(settings_routes.router, prefix="/api/settings", tags=["Settings"])
+    app.include_router(agent.router, prefix="/api/agent", tags=["Agent"])
 
     # Health check endpoint
     @app.get("/health")
