@@ -308,7 +308,27 @@ class PentestOrchestrator:
         """
         tasks = []
 
-        # Phase 1: Reconnaissance - Always start with nmap
+        # Normalize target - ensure web URLs have http:// prefix
+        target_address = target.address
+        is_web = target.target_type == "web" or target_address.startswith("http")
+
+        # Extract host for nmap (strip protocol and path)
+        if target_address.startswith("http://"):
+            host_only = target_address.replace("http://", "").split("/")[0].split(":")[0]
+        elif target_address.startswith("https://"):
+            host_only = target_address.replace("https://", "").split("/")[0].split(":")[0]
+        else:
+            host_only = target_address.split("/")[0].split(":")[0]
+
+        # For web tools, ensure URL has protocol
+        if is_web and not target_address.startswith("http"):
+            web_url = f"http://{target_address}"
+        else:
+            web_url = target_address if target_address.startswith("http") else f"http://{target_address}"
+
+        logger.info(f"Task generation: host={host_only}, web_url={web_url}, is_web={is_web}")
+
+        # Phase 1: Reconnaissance - nmap on host only (no protocol)
         nmap_task = Task(
             id=str(uuid.uuid4()),
             name=f"Port Scan: {target.name}",
@@ -318,17 +338,17 @@ class PentestOrchestrator:
             target_id=target.id,
             tool="nmap",
             parameters={
-                "target_address": target.address,
-                "scan_type": "comprehensive",
-                "top_ports": 1000
+                "target_address": host_only,
+                "scan_type": "default",
+                "service_detection": True
             },
             requires_approval=False
         )
         tasks.append(nmap_task)
 
-        # Technology fingerprinting
-        if target.target_type == "web" or target.address.startswith("http"):
-            # Web technology detection
+        # Web-specific tasks with proper URLs
+        if is_web:
+            # Technology fingerprinting with http:// URL
             whatweb_task = Task(
                 id=str(uuid.uuid4()),
                 name=f"Technology Fingerprint: {target.name}",
@@ -337,12 +357,12 @@ class PentestOrchestrator:
                 risk_level="low",
                 target_id=target.id,
                 tool="whatweb",
-                parameters={"target_address": target.address},
+                parameters={"target_address": web_url},
                 requires_approval=False
             )
             tasks.append(whatweb_task)
 
-            # Curl for initial headers
+            # Curl with proper URL
             curl_task = Task(
                 id=str(uuid.uuid4()),
                 name=f"HTTP Headers: {target.name}",
@@ -352,14 +372,14 @@ class PentestOrchestrator:
                 target_id=target.id,
                 tool="curl",
                 parameters={
-                    "target_address": target.address,
+                    "target_address": web_url,
                     "follow_redirects": True
                 },
                 requires_approval=False
             )
             tasks.append(curl_task)
 
-            # Directory enumeration
+            # Directory enumeration with proper URL
             gobuster_task = Task(
                 id=str(uuid.uuid4()),
                 name=f"Directory Enumeration: {target.name}",
@@ -369,7 +389,7 @@ class PentestOrchestrator:
                 target_id=target.id,
                 tool="gobuster",
                 parameters={
-                    "target_address": target.address,
+                    "target_address": web_url,
                     "mode": "dir",
                     "extensions": "php,html,txt,bak,old"
                 },
@@ -377,7 +397,7 @@ class PentestOrchestrator:
             )
             tasks.append(gobuster_task)
 
-            # Web vulnerability scan
+            # Web vulnerability scan with proper URL
             nikto_task = Task(
                 id=str(uuid.uuid4()),
                 name=f"Web Vulnerability Scan: {target.name}",
@@ -386,7 +406,7 @@ class PentestOrchestrator:
                 risk_level="medium",
                 target_id=target.id,
                 tool="nikto",
-                parameters={"target_address": target.address},
+                parameters={"target_address": web_url},
                 requires_approval=settings.automation_level == "manual"
             )
             tasks.append(nikto_task)
