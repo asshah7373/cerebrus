@@ -1068,19 +1068,46 @@ class CurlTool(CommandTool):
 # Import CVE lookup tools
 from .cve_lookup import CVELookupTool, ExploitSearchTool
 
+# Import exploit and post-exploitation tools
+from .exploit_tools import (
+    SearchsploitTool,
+    ExploitMirrorTool,
+    MetasploitSearchTool,
+    LinpeasTool,
+    WinpeasTool,
+    LinenumTool,
+    NetcatListenerTool,
+    ReverseShellGeneratorTool,
+)
+
 
 # Tool registry for easy importing
 KALI_TOOLS = [
+    # Reconnaissance & Scanning
     NmapTool,
     NiktoTool,
-    GobusterTool,
-    HydraTool,
-    SQLMapTool,
     WhatWebTool,
-    FFufTool,
     CurlTool,
+    # Enumeration
+    GobusterTool,
+    FFufTool,
+    # Credential Testing
+    HydraTool,
+    # Web Exploitation
+    SQLMapTool,
+    # CVE & Exploit Search
     CVELookupTool,
     ExploitSearchTool,
+    SearchsploitTool,
+    ExploitMirrorTool,
+    MetasploitSearchTool,
+    # Post-Exploitation
+    LinpeasTool,
+    WinpeasTool,
+    LinenumTool,
+    # Shell Handling
+    NetcatListenerTool,
+    ReverseShellGeneratorTool,
 ]
 
 

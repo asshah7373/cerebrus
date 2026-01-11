@@ -255,53 +255,30 @@ class PentestOrchestrator:
     async def _plan_attack_node(self, state: PentestState) -> Dict[str, Any]:
         """
         Plan the attack strategy based on targets and objectives.
-        This generates the initial task queue.
+        This generates the initial task queue using PentestGPT methodology.
         """
         logger.info("Planning attack strategy")
 
         tasks = []
         task_queue = []
 
+        # Send activity update
+        await self._send_activity(
+            state.session_id,
+            "planning",
+            f"Developing attack plan for {len(state.targets)} target(s)..."
+        )
+
         for target in state.targets:
-            # Generate reconnaissance tasks
-            recon_task = Task(
-                id=str(uuid.uuid4()),
-                name=f"Reconnaissance: {target.name}",
-                task_type="recon",
-                status=TaskStatus.PENDING,
-                risk_level="low",
-                target_id=target.id,
-                parameters={"target_address": target.address}
+            target_tasks = await self._generate_initial_tasks(target, state.user_objective)
+            tasks.extend(target_tasks)
+            task_queue.extend([t.id for t in target_tasks])
+
+            await self._send_activity(
+                state.session_id,
+                "task_created",
+                f"Generated {len(target_tasks)} initial tasks for {target.name}"
             )
-            tasks.append(recon_task)
-            task_queue.append(recon_task.id)
-
-            # Generate scanning tasks based on target type
-            if target.target_type == "web":
-                scan_task = Task(
-                    id=str(uuid.uuid4()),
-                    name=f"Web Vulnerability Scan: {target.name}",
-                    task_type="scan",
-                    status=TaskStatus.PENDING,
-                    risk_level="medium",
-                    target_id=target.id,
-                    tool="nikto",
-                    requires_approval=True
-                )
-            else:
-                scan_task = Task(
-                    id=str(uuid.uuid4()),
-                    name=f"Port Scan: {target.name}",
-                    task_type="scan",
-                    status=TaskStatus.PENDING,
-                    risk_level="medium",
-                    target_id=target.id,
-                    tool="nmap",
-                    requires_approval=settings.automation_level == "manual"
-                )
-
-            tasks.append(scan_task)
-            task_queue.append(scan_task.id)
 
         return {
             "workflow_phase": "planning",
@@ -314,6 +291,108 @@ class PentestOrchestrator:
                 "timestamp": datetime.utcnow().isoformat()
             }]
         }
+
+    async def _generate_initial_tasks(self, target: Target, objective: str) -> List[Task]:
+        """
+        Generate intelligent initial tasks based on target type.
+        Follows PentestGPT's CTF methodology.
+        """
+        tasks = []
+
+        # Phase 1: Reconnaissance - Always start with nmap
+        nmap_task = Task(
+            id=str(uuid.uuid4()),
+            name=f"Port Scan: {target.name}",
+            task_type="recon",
+            status=TaskStatus.PENDING,
+            risk_level="low",
+            target_id=target.id,
+            tool="nmap",
+            parameters={
+                "target_address": target.address,
+                "scan_type": "comprehensive",
+                "top_ports": 1000
+            },
+            requires_approval=False
+        )
+        tasks.append(nmap_task)
+
+        # Technology fingerprinting
+        if target.target_type == "web" or target.address.startswith("http"):
+            # Web technology detection
+            whatweb_task = Task(
+                id=str(uuid.uuid4()),
+                name=f"Technology Fingerprint: {target.name}",
+                task_type="recon",
+                status=TaskStatus.PENDING,
+                risk_level="low",
+                target_id=target.id,
+                tool="whatweb",
+                parameters={"target_address": target.address},
+                requires_approval=False
+            )
+            tasks.append(whatweb_task)
+
+            # Curl for initial headers
+            curl_task = Task(
+                id=str(uuid.uuid4()),
+                name=f"HTTP Headers: {target.name}",
+                task_type="recon",
+                status=TaskStatus.PENDING,
+                risk_level="low",
+                target_id=target.id,
+                tool="curl",
+                parameters={
+                    "target_address": target.address,
+                    "follow_redirects": True
+                },
+                requires_approval=False
+            )
+            tasks.append(curl_task)
+
+            # Directory enumeration
+            gobuster_task = Task(
+                id=str(uuid.uuid4()),
+                name=f"Directory Enumeration: {target.name}",
+                task_type="recon",
+                status=TaskStatus.PENDING,
+                risk_level="low",
+                target_id=target.id,
+                tool="gobuster",
+                parameters={
+                    "target_address": target.address,
+                    "mode": "dir",
+                    "extensions": "php,html,txt,bak,old"
+                },
+                requires_approval=False
+            )
+            tasks.append(gobuster_task)
+
+            # Web vulnerability scan
+            nikto_task = Task(
+                id=str(uuid.uuid4()),
+                name=f"Web Vulnerability Scan: {target.name}",
+                task_type="scan",
+                status=TaskStatus.PENDING,
+                risk_level="medium",
+                target_id=target.id,
+                tool="nikto",
+                parameters={"target_address": target.address},
+                requires_approval=settings.automation_level == "manual"
+            )
+            tasks.append(nikto_task)
+
+        # Check for CTF-style objective
+        objective_lower = objective.lower()
+        if any(kw in objective_lower for kw in ["ctf", "htb", "flag", "hackthebox", "capture"]):
+            # Add CTF-specific tasks
+            await self._send_activity(
+                target.id,
+                "reasoning",
+                "CTF/HTB detected - adding flag hunting tasks"
+            )
+
+        return tasks
 
     async def _select_agent_node(self, state: PentestState) -> Dict[str, Any]:
         """Select the appropriate agent for the current task."""
