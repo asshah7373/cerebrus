@@ -937,24 +937,29 @@ class PentestOrchestrator:
             technologies = parsed_data.get("technologies", parsed_data.get("plugins", {}))
             if technologies:
                 tech_list = []
-                for tech_name, tech_info in technologies.items():
-                    if isinstance(tech_info, dict):
-                        version = tech_info.get("version", [""])[0] if tech_info.get("version") else ""
-                        tech_list.append(f"{tech_name} {version}".strip())
-                    else:
-                        tech_list.append(tech_name)
+                # Handle both dict and list formats
+                if isinstance(technologies, dict):
+                    for tech_name, tech_info in technologies.items():
+                        if isinstance(tech_info, dict):
+                            version = tech_info.get("version", [""])[0] if tech_info.get("version") else ""
+                            tech_list.append(f"{tech_name} {version}".strip())
+                        else:
+                            tech_list.append(tech_name)
+                elif isinstance(technologies, list):
+                    tech_list = [str(t) for t in technologies[:10]]
 
-                findings.append(Finding(
-                    id=str(uuid.uuid4()),
-                    title=f"Technology Stack Identified: {target}",
-                    description=f"The following technologies were detected on {target}:\n" + "\n".join(f"- {t}" for t in tech_list[:10]),
-                    severity=SeverityLevel.INFO,
-                    category="Information Disclosure",
-                    target=target,
-                    evidence=f"WhatWeb scan results:\n{output[:1000]}",
-                    remediation="Review exposed technologies and ensure they are up-to-date. Remove unnecessary version headers.",
-                    discovered_at=datetime.utcnow()
-                ))
+                if tech_list:
+                    findings.append(Finding(
+                        id=str(uuid.uuid4()),
+                        title=f"Technology Stack Identified: {target}",
+                        description=f"The following technologies were detected on {target}:\n" + "\n".join(f"- {t}" for t in tech_list[:10]),
+                        severity=SeverityLevel.INFO,
+                        category="Information Disclosure",
+                        target=target,
+                        evidence=f"WhatWeb scan results:\n{output[:1000]}",
+                        remediation="Review exposed technologies and ensure they are up-to-date. Remove unnecessary version headers.",
+                        discovered_at=datetime.utcnow()
+                    ))
 
         # Curl header analysis
         if "headers" in parsed_data:

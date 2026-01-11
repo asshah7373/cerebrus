@@ -504,36 +504,45 @@ Respond in this JSON format:
         if "technologies" in parsed_data or "plugins" in parsed_data:
             techs = parsed_data.get("technologies", parsed_data.get("plugins", {}))
             if techs:
-                findings.append({
-                    "title": "Technology Stack Identified",
-                    "description": f"Detected: {', '.join(list(techs.keys())[:5])}",
-                    "severity": "info",
-                    "category": "Information Disclosure",
-                    "evidence": str(list(techs.keys())),
-                    "remediation": "Ensure all technologies are up to date"
-                })
+                # Handle both dict and list formats
+                if isinstance(techs, dict):
+                    tech_names = list(techs.keys())
+                elif isinstance(techs, list):
+                    tech_names = [str(t) for t in techs]
+                else:
+                    tech_names = []
 
-                # Check for specific vulnerable technologies
-                for tech in techs.keys():
-                    tech_lower = tech.lower()
-                    if "xwiki" in tech_lower:
-                        next_tasks.append({
-                            "name": "Search for XWiki CVEs",
-                            "task_type": "recon",
-                            "tool": "cve_search",
-                            "risk_level": "low",
-                            "parameters": {"product": "xwiki"},
-                            "reasoning": "XWiki detected - check for known vulnerabilities"
-                        })
-                    elif "wordpress" in tech_lower:
-                        next_tasks.append({
-                            "name": "WordPress vulnerability scan",
-                            "task_type": "scan",
-                            "tool": "wpscan",
-                            "risk_level": "medium",
-                            "parameters": {"target": target},
-                            "reasoning": "WordPress detected"
-                        })
+                if tech_names:
+                    findings.append({
+                        "title": "Technology Stack Identified",
+                        "description": f"Detected: {', '.join(tech_names[:5])}",
+                        "severity": "info",
+                        "category": "Information Disclosure",
+                        "evidence": str(tech_names),
+                        "remediation": "Ensure all technologies are up to date"
+                    })
+
+                    # Check for specific vulnerable technologies
+                    for tech in tech_names:
+                        tech_lower = tech.lower()
+                        if "xwiki" in tech_lower:
+                            next_tasks.append({
+                                "name": "Search for XWiki CVEs",
+                                "task_type": "recon",
+                                "tool": "cve_search",
+                                "risk_level": "low",
+                                "parameters": {"product": "xwiki"},
+                                "reasoning": "XWiki detected - check for known vulnerabilities"
+                            })
+                        elif "wordpress" in tech_lower:
+                            next_tasks.append({
+                                "name": "WordPress vulnerability scan",
+                                "task_type": "scan",
+                                "tool": "wpscan",
+                                "risk_level": "medium",
+                                "parameters": {"target": target},
+                                "reasoning": "WordPress detected"
+                            })
 
         # Nikto findings
         if "findings" in parsed_data:
